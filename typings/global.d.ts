@@ -41,6 +41,7 @@ declare module '@micro-app/types' {
     record(): void
     rebuild(): void
     release(clearTimer?: boolean): void
+    dispose?(): void
   }
 
   interface SandBoxStartParams {
@@ -93,6 +94,7 @@ declare module '@micro-app/types' {
     microAppWindow: Window // Proxy target
     start (startParams: SandBoxStartParams): void
     stop (stopParams: SandBoxStopParams): void
+    destroy (): void
     recordAndReleaseEffect (options: releaseGlobalEffectParams, preventRecord?: boolean): void
     // reset effect snapshot data
     resetEffectSnapshot(): void
@@ -225,6 +227,9 @@ declare module '@micro-app/types' {
 
     // is app unmounted
     isUnmounted (): boolean
+
+    // is app permanently destroyed
+    isDestroyed? (): boolean
 
     // is app already hidden
     isHidden (): boolean

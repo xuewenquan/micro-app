@@ -3,7 +3,6 @@ import type {
   MicroEventListener,
   CommonEffectHook,
 } from '@micro-app/types'
-import type IframeSandbox from './index'
 import {
   rawDefineProperty,
   rawDefineProperties,
@@ -34,6 +33,8 @@ import {
   appInstanceMap,
 } from '../../create_app'
 import microApp from '../../micro_app'
+import createListenerEffect from '../listener_effect'
+import { retainSandboxDom7Cleanup } from '../event_target'
 
 /**
  * TODO: 1、shadowDOM 2、结构优化
@@ -47,10 +48,9 @@ import microApp from '../../micro_app'
 export function patchDocument (
   appName: string,
   microAppWindow: microAppWindowType,
-  sandbox: IframeSandbox,
 ): CommonEffectHook {
   patchDocumentPrototype(appName, microAppWindow)
-  patchDocumentProperty(appName, microAppWindow, sandbox)
+  patchDocumentProperty(appName, microAppWindow)
 
   return patchDocumentEffect(appName, microAppWindow)
 }
@@ -265,7 +265,6 @@ function patchDocumentPrototype (appName: string, microAppWindow: microAppWindow
 function patchDocumentProperty (
   appName: string,
   microAppWindow: microAppWindowType,
-  sandbox: IframeSandbox,
 ): void {
   const rawDocument = globalEnv.rawDocument
   const microRootDocument = microAppWindow.Document
@@ -286,8 +285,8 @@ function patchDocumentProperty (
     const result: PropertyDescriptorMap = {}
     const descList: Array<[string, () => unknown]> = [
       // if disable-memory-router or router-mode='disable', href point to base app
-      ['documentURI', () => sandbox.proxyLocation.href],
-      ['URL', () => sandbox.proxyLocation.href],
+      ['documentURI', () => appInstanceMap.get(appName)?.sandBox?.proxyWindow?.location.href || rawDocument.documentURI],
+      ['URL', () => appInstanceMap.get(appName)?.sandBox?.proxyWindow?.location.href || rawDocument.URL],
       ['documentElement', () => rawDocument.documentElement],
       ['scrollingElement', () => rawDocument.scrollingElement],
       ['forms', () => microRootDocument.prototype.querySelectorAll.call(microDocument, 'form')],
@@ -333,7 +332,7 @@ function patchDocumentProperty (
       get: () => {
         throttleDeferForIframeAppName(appName)
         if (tagName === 'body' && microApp?.options?.inheritBaseBody !== true) {
-          return sandbox.options.container?.querySelector('micro-app-body') || rawDocument[tagName]
+          return appInstanceMap.get(appName)?.container?.querySelector('micro-app-body') || rawDocument[tagName]
         }
         return rawDocument[tagName]
       },
@@ -344,12 +343,13 @@ function patchDocumentProperty (
 
 function patchDocumentEffect (appName: string, microAppWindow: microAppWindowType): CommonEffectHook {
   const { rawDocument, rawAddEventListener, rawRemoveEventListener, rawDispatchEvent } = globalEnv
-  const eventListenerMap = new Map<string, Set<MicroEventListener>>()
-  const sstEventListenerMap = new Map<string, Set<MicroEventListener>>()
   let onClickHandler: unknown = null
   let sstOnClickHandler: unknown = null
   const microRootDocument = microAppWindow.Document
   const microDocument = microAppWindow.document
+  const listenerEffect = createListenerEffect(rawAddEventListener, rawRemoveEventListener,
+    (record) => retainSandboxDom7Cleanup(appName, record))
+  const boundListenerMap = new WeakMap<CallableFunction, MicroEventListener>()
 
   function getEventTarget (type: string, bindTarget: Document): Document {
     return SCOPE_DOCUMENT_EVENT.includes(type) ? bindTarget : rawDocument
@@ -360,15 +360,12 @@ function patchDocumentEffect (appName: string, microAppWindow: microAppWindowTyp
     listener: MicroEventListener,
     options?: boolean | AddEventListenerOptions,
   ): void {
-    const handler = isFunction(listener) ? (listener.__MICRO_APP_BOUND_FUNCTION__ = listener.__MICRO_APP_BOUND_FUNCTION__ || listener.bind(this)) : listener
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList) {
-      listenerList.add(listener)
-    } else {
-      eventListenerMap.set(type, new Set([listener]))
+    let handler = listener
+    if (isFunction(listener)) {
+      handler = boundListenerMap.get(listener) || listener.bind(this)
+      boundListenerMap.set(listener, handler)
     }
-    listener && (listener.__MICRO_APP_MARK_OPTIONS__ = options)
-    rawAddEventListener.call(getEventTarget(type, this), type, handler, options)
+    listenerEffect.add(getEventTarget(type, this), type, listener, options, handler)
   }
 
   microRootDocument.prototype.removeEventListener = function (
@@ -376,12 +373,8 @@ function patchDocumentEffect (appName: string, microAppWindow: microAppWindowTyp
     listener: MicroEventListener,
     options?: boolean | AddEventListenerOptions,
   ): void {
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList?.size && listenerList.has(listener)) {
-      listenerList.delete(listener)
-    }
-    const handler = listener?.__MICRO_APP_BOUND_FUNCTION__ || listener
-    rawRemoveEventListener.call(getEventTarget(type, this), type, handler, options)
+    const handler = isFunction(listener) ? boundListenerMap.get(listener) || listener : listener
+    listenerEffect.remove(getEventTarget(type, this), type, listener, options, handler)
   }
 
   microRootDocument.prototype.dispatchEvent = function (event: Event): boolean {
@@ -435,7 +428,7 @@ function patchDocumentEffect (appName: string, microAppWindow: microAppWindowTyp
     })
 
   const reset = (): void => {
-    sstEventListenerMap.clear()
+    listenerEffect.reset()
     sstOnClickHandler = null
   }
 
@@ -456,12 +449,7 @@ function patchDocumentEffect (appName: string, microAppWindow: microAppWindowTyp
     sstOnClickHandler = onClickHandler || sstOnClickHandler
 
     // record document event
-    eventListenerMap.forEach((listenerList, type) => {
-      if (listenerList.size) {
-        const cacheList = sstEventListenerMap.get(type) || []
-        sstEventListenerMap.set(type, new Set([...cacheList, ...listenerList]))
-      }
-    })
+    listenerEffect.record()
   }
 
   // rebuild event and timer before remount app
@@ -469,13 +457,9 @@ function patchDocumentEffect (appName: string, microAppWindow: microAppWindowTyp
     // rebuild onclick event
     if (sstOnClickHandler && !onClickHandler) microDocument.onclick = sstOnClickHandler
 
-    sstEventListenerMap.forEach((listenerList, type) => {
-      for (const listener of listenerList) {
-        microDocument.addEventListener(type, listener, listener?.__MICRO_APP_MARK_OPTIONS__)
-      }
+    listenerEffect.rebuild((record) => {
+      microDocument.addEventListener(record.type, record.listener, record.options)
     })
-
-    reset()
   }
 
   const release = (): void => {
@@ -486,18 +470,7 @@ function patchDocumentEffect (appName: string, microAppWindow: microAppWindowTyp
     onClickHandler = null
 
     // Clear document binding event
-    if (eventListenerMap.size) {
-      eventListenerMap.forEach((listenerList, type) => {
-        for (const listener of listenerList) {
-          rawRemoveEventListener.call(
-            getEventTarget(type, microDocument),
-            type,
-            listener?.__MICRO_APP_BOUND_FUNCTION__ || listener,
-          )
-        }
-      })
-      eventListenerMap.clear()
-    }
+    listenerEffect.release()
   }
 
   return {
@@ -505,5 +478,6 @@ function patchDocumentEffect (appName: string, microAppWindow: microAppWindowTyp
     record,
     rebuild,
     release,
+    dispose: listenerEffect.dispose,
   }
 }

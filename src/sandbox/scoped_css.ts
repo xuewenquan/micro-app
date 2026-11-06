@@ -2,6 +2,7 @@
 import type { AppInterface } from '@micro-app/types'
 import { CompletionPath, getLinkFileDir, logError, trim, isFireFox } from '../libs/utils'
 import microApp from '../micro_app'
+import { addScopedCSSObserver, removeScopedCSSObserver } from './scoped_css_observers'
 
 // common regular expression
 // const rootSelectorREG = /(^|\s+)(html|:root)(?=[\s>~[.#:]+|$)/
@@ -516,6 +517,11 @@ function commonAction (
 }
 
 let parser: CSSParser
+
+export function hasScopedPrefix (cssText: string, prefix: string): boolean {
+  return cssText.includes(prefix)
+}
+
 /**
  * scopedCSS
  * @param styleElement target style element
@@ -531,23 +537,28 @@ export default function scopedCSS (
 
     if (!parser) parser = new CSSParser()
 
-    const escapeRegExp = (regStr: string) => regStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
     if (styleElement.textContent) {
       commonAction(styleElement, app.name, prefix, app.url, linkPath)
 
       const observer = new MutationObserver(() => {
-        const escapedPrefix = escapeRegExp(prefix)
-        const isPrefixed = styleElement.textContent && new RegExp(escapedPrefix).test(styleElement.textContent)
+        removeScopedCSSObserver(app.name, observer)
+        // This is an exact literal prefix, not a pattern. Using RegExp here is
+        // unnecessary and previously made dynamic app names such as
+        // `WS-Component-TypeRenderMenu-...` enter a character class and throw
+        // "Range out of order in character class" when an old/unescaped build
+        // was loaded.
+        const isPrefixed = styleElement.textContent && hasScopedPrefix(styleElement.textContent, prefix)
         observer.disconnect()
         if (!isPrefixed) {
           styleElement.__MICRO_APP_HAS_SCOPED__ = false
           scopedCSS(styleElement, app, linkPath)
         }
       })
+      addScopedCSSObserver(app.name, observer)
       observer.observe(styleElement, { childList: true, characterData: true })
     } else {
       const observer = new MutationObserver(function () {
+        removeScopedCSSObserver(app.name, observer)
         observer.disconnect()
         // styled-component will be ignore
         if (styleElement.textContent && !styleElement.hasAttribute('data-styled')) {
@@ -561,6 +572,7 @@ export default function scopedCSS (
         }
       })
 
+      addScopedCSSObserver(app.name, observer)
       observer.observe(styleElement, { childList: true })
     }
   }

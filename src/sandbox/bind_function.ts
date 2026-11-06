@@ -3,18 +3,49 @@ import {
   isBoundFunction,
   isConstructor,
   rawDefineProperty,
-  isBoolean,
   isFunction,
 } from '../libs/utils'
 
-function isBoundedFunction (value: CallableFunction & {__MICRO_APP_IS_BOUND_FUNCTION__: boolean}): boolean {
-  if (isBoolean(value.__MICRO_APP_IS_BOUND_FUNCTION__)) return value.__MICRO_APP_IS_BOUND_FUNCTION__
-  return value.__MICRO_APP_IS_BOUND_FUNCTION__ = isBoundFunction(value)
+const boundFunctionState = new WeakMap<CallableFunction, boolean>()
+const constructorState = new WeakMap<FunctionConstructor, boolean>()
+const boundFunctionCache = new WeakMap<CallableFunction, WeakMap<object, Map<string, CallableFunction>>>()
+
+function isBoundedFunction (value: CallableFunction): boolean {
+  if (!boundFunctionState.has(value)) boundFunctionState.set(value, isBoundFunction(value))
+  return boundFunctionState.get(value)!
 }
 
-function isConstructorFunction (value: FunctionConstructor & {__MICRO_APP_IS_CONSTRUCTOR__: boolean}) {
-  if (isBoolean(value.__MICRO_APP_IS_CONSTRUCTOR__)) return value.__MICRO_APP_IS_CONSTRUCTOR__
-  return value.__MICRO_APP_IS_CONSTRUCTOR__ = isConstructor(value)
+function isConstructorFunction (value: FunctionConstructor): boolean {
+  if (!constructorState.has(value)) constructorState.set(value, isConstructor(value))
+  return constructorState.get(value)!
+}
+
+function getBoundFunction (
+  value: CallableFunction,
+  rawTarget: object,
+  key: string,
+): CallableFunction | null {
+  return boundFunctionCache.get(value)?.get(rawTarget)?.get(key) || null
+}
+
+function cacheBoundFunction (
+  value: CallableFunction,
+  rawTarget: object,
+  key: string,
+  boundFunction: CallableFunction,
+): void {
+  let targetCache = boundFunctionCache.get(value)
+  if (!targetCache) {
+    targetCache = new WeakMap()
+    boundFunctionCache.set(value, targetCache)
+  }
+
+  let keyCache = targetCache.get(rawTarget)
+  if (!keyCache) {
+    keyCache = new Map()
+    targetCache.set(rawTarget, keyCache)
+  }
+  keyCache.set(key, boundFunction)
 }
 
 // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
@@ -26,10 +57,11 @@ export default function bindFunctionToRawTarget<T = Window, B = unknown> (value:
    *  document.all:
    *    - typeof document.all ==> 'function'
    *    - document.all.bind ==> undefined
-   */
+  */
   if (isFunction(value) && !isConstructorFunction(value) && !isBoundedFunction(value) && value.bind) {
-    const cacheKey = `__MICRO_APP_BOUND_${key}_FUNCTION__`
-    if (value[cacheKey]) return value[cacheKey]
+    const cacheTarget = rawTarget as unknown as object
+    const cachedFunction = getBoundFunction(value, cacheTarget, key)
+    if (cachedFunction) return cachedFunction as unknown as B
 
     const bindRawObjectValue = value.bind(rawTarget)
 
@@ -46,7 +78,8 @@ export default function bindFunctionToRawTarget<T = Window, B = unknown> (value:
       })
     }
 
-    return value[cacheKey] = bindRawObjectValue
+    cacheBoundFunction(value, cacheTarget, key, bindRawObjectValue)
+    return bindRawObjectValue
   }
 
   return value

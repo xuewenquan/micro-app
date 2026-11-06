@@ -9,7 +9,8 @@ import type {
   CommonEffectHook,
   releaseGlobalEffectParams,
 } from '@micro-app/types'
-import globalEnv from '../../libs/global_env'
+import globalEnv, { clearActiveProxyWindow, releaseRawGlobalObjectSnapshots } from '../../libs/global_env'
+import { runCleanupStep } from '../../libs/cleanup'
 import microApp from '../../micro_app'
 import {
   EventCenterForMicroApp,
@@ -68,8 +69,18 @@ import {
   createMicroFetch,
   useMicroEventSource,
   createMicroXMLHttpRequest,
+  createXMLHttpRequestScope,
+  disposeXMLHttpRequestScope,
 } from '../request'
 import { releaseWorkersByApp } from '../../proxies/worker'
+import {
+  activateEventTargetEffect,
+  disposeEventTargetEffect,
+  rebuildEventTargetSnapshot,
+  recordEventTargetSnapshot,
+  releaseEventTargetListeners,
+  resetEventTargetSnapshot,
+} from '../event_target'
 
 // TODO: 放到global.d.ts
 export type MicroAppWindowDataType = {
@@ -96,6 +107,8 @@ const { createMicroEventSource, clearMicroEventSource } = useMicroEventSource()
 export default class WithSandBox extends BaseSandbox implements WithSandBoxInterface {
   static activeCount = 0 // number of active sandbox
   private active = false
+  private destroyed = false
+  private readonly requestScope = createXMLHttpRequestScope()
   private windowEffect!: CommonEffectHook
   private documentEffect!: CommonEffectHook
   private removeHistoryListener!: CallableFunction
@@ -134,7 +147,8 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
     defaultPage,
     disablePatchRequest,
   }: SandBoxStartParams): void {
-    if (this.active) return
+    if (this.active || this.destroyed) return
+    activateEventTargetEffect(this.microAppWindow.__MICRO_APP_NAME__)
     this.active = true
 
     /* --- memory router part --- start */
@@ -211,6 +225,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
      *  4. mount & unmount hook should delete in default mode when stop
      */
     if (!umdMode || destroy) {
+      clearActiveProxyWindow(this.proxyWindow)
       clearMicroEventSource(this.microAppWindow.__MICRO_APP_NAME__)
       releaseWorkersByApp(this.microAppWindow.__MICRO_APP_NAME__)
 
@@ -228,6 +243,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
     }
 
     if (--globalEnv.activeSandbox === 0) {
+      releaseRawGlobalObjectSnapshots()
       releasePatchElementAndDocument()
       releasePatchHistory()
     }
@@ -237,6 +253,90 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
     }
 
     this.active = false
+  }
+
+  /**
+   * Terminal cleanup. A destroyed sandbox cannot be started again.
+   */
+  public destroy (): void {
+    if (this.destroyed) return
+    const appName = this.microAppWindow.__MICRO_APP_NAME__
+    const cleanup = (label: string, action: () => void) => runCleanupStep(appName, label, action)
+
+    if (this.active) {
+      cleanup('stop with sandbox', () => this.stop({
+        umdMode: false,
+        keepRouteState: false,
+        destroy: true,
+        clearData: true,
+      }))
+    } else {
+      // A keep-alive/UMD app may have stopped without clearing persistent
+      // effects. A later destroy must still release observers, timers and
+      // listeners that were intentionally preserved during stop.
+      cleanup('release persistent effects', () => this.releaseGlobalEffect({ clearData: true, destroy: true }))
+    }
+
+    this.destroyed = true
+    cleanup('abort owned XMLHttpRequests', () => disposeXMLHttpRequestScope(this.requestScope))
+    cleanup('clear execution pointer', () => clearActiveProxyWindow(this.proxyWindow))
+    cleanup('clear UMD hooks', () => this.clearHijackUmdHooks?.())
+    cleanup('reset effect snapshots', () => this.resetEffectSnapshot())
+    cleanup('dispose EventTarget effects', () => disposeEventTargetEffect(appName))
+    // stop() performs these cleanups for an active sandbox. A keep-alive app
+    // can already be inactive when terminal destroy is requested, so repeat
+    // the idempotent cleanup here to cover that path as well.
+    cleanup('clear EventSource', () => clearMicroEventSource(appName))
+    cleanup('release workers', () => releaseWorkersByApp(appName))
+
+    const microAppWindow = this.microAppWindow
+    ;[
+      '__MICRO_APP_WINDOW__',
+      '__MICRO_APP_PROXY_WINDOW__',
+      '__MICRO_APP_SANDBOX__',
+      'microApp',
+      'rawWindow',
+      'rawDocument',
+    ].forEach((key) => cleanup(`clear ${key}`, () => { Reflect.deleteProperty(microAppWindow, key) }))
+
+    // A keep-alive/UMD app can already be inactive when terminal destroy is
+    // requested. In that case stop() intentionally kept all injected globals,
+    // so clearing only the bookkeeping sets leaves webpack/Vue runtimes on the
+    // CustomWindow (and escaped values on rawWindow) forever.
+    this.injectedKeys.forEach((key: PropertyKey) => {
+      cleanup(`clear injected ${String(key)}`, () => { Reflect.deleteProperty(microAppWindow, key) })
+    })
+    this.injectedKeys.clear()
+
+    this.escapeKeys.forEach((key: PropertyKey) => {
+      cleanup(`clear escaped ${String(key)}`, () => { Reflect.deleteProperty(globalEnv.rawWindow, key) })
+    })
+    this.escapeKeys.clear()
+    cleanup('dispose window effects', () => this.windowEffect?.dispose?.())
+    cleanup('dispose document effects', () => this.documentEffect?.dispose?.())
+
+    // CustomWindow is a synthetic per-app global, so no property needs to
+    // survive terminal destruction. Clear framework descriptors as well as
+    // child globals. Otherwise document/window/self and compiled webpack/Vue
+    // runtimes keep the complete application graph reachable.
+    Reflect.ownKeys(microAppWindow).forEach((key) => {
+      cleanup(`clear CustomWindow ${String(key)}`, () => {
+        const descriptor = Object.getOwnPropertyDescriptor(microAppWindow, key)
+        if (descriptor?.configurable) {
+          Reflect.deleteProperty(microAppWindow, key)
+        } else if ('value' in (descriptor || {}) && descriptor?.writable) {
+          // Defensive fallback for a child-defined non-configurable data value.
+          Reflect.set(microAppWindow, key, null)
+        }
+      })
+    })
+    ;(this as any).windowEffect = null
+    ;(this as any).documentEffect = null
+    ;(this as any).removeHistoryListener = null
+    ;(this as any).sandboxReady = null
+    ;(this as any).clearHijackUmdHooks = null
+    ;(this as any).proxyWindow = null
+    ;(this as any).microAppWindow = null
   }
 
   /**
@@ -293,6 +393,11 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
       this.resetEffectSnapshot()
     } else {
       this.recordEffectSnapshot()
+      if (options.keepAlive || options.isPrerender) {
+        // Element/EventTarget listeners belong to the preserved DOM tree and
+        // must remain live while a keep-alive app is hidden.
+        resetEventTargetSnapshot(this.microAppWindow.__MICRO_APP_NAME__)
+      }
     }
     this.releaseGlobalEffect(options)
   }
@@ -306,6 +411,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
   public resetEffectSnapshot (): void {
     this.windowEffect.reset()
     this.documentEffect.reset()
+    resetEventTargetSnapshot(this.microAppWindow.__MICRO_APP_NAME__)
     resetDataCenterSnapshot(this.microAppWindow.microApp)
   }
 
@@ -319,6 +425,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
   public recordEffectSnapshot (): void {
     this.windowEffect.record()
     this.documentEffect.record()
+    recordEventTargetSnapshot(this.microAppWindow.__MICRO_APP_NAME__)
     recordDataCenterSnapshot(this.microAppWindow.microApp)
   }
 
@@ -326,6 +433,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
   public rebuildEffectSnapshot (): void {
     this.windowEffect.rebuild()
     this.documentEffect.rebuild()
+    rebuildEventTargetSnapshot(this.microAppWindow.__MICRO_APP_NAME__)
     rebuildDataCenterSnapshot(this.microAppWindow.microApp)
   }
 
@@ -351,6 +459,9 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
     // default mode(not keep-alive or isPrerender)
     this.windowEffect.release((!umdMode && !keepAlive && !isPrerender) || destroy)
     this.documentEffect.release()
+    if ((!keepAlive && !isPrerender) || destroy) {
+      releaseEventTargetListeners(this.microAppWindow.__MICRO_APP_NAME__)
+    }
     this.microAppWindow.microApp?.clearDataListener()
     this.microAppWindow.microApp?.clearGlobalDataListener()
     if (clearData) {
@@ -425,10 +536,12 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
   }
 
   private createDescriptorForMicroAppWindow (key: PropertyKey, value: unknown): PropertyDescriptor {
-    const { configurable = true, enumerable = true, writable, set } = Object.getOwnPropertyDescriptor(globalEnv.rawWindow, key) || { writable: true }
+    const { enumerable = true, writable, set } = Object.getOwnPropertyDescriptor(globalEnv.rawWindow, key) || { writable: true }
     const descriptor: PropertyDescriptor = {
       value,
-      configurable,
+      // The target is CustomWindow rather than the browser Window. It must be
+      // possible to remove these self-referential mappings on destroy.
+      configurable: true,
       enumerable,
       writable: writable ?? !!set
     }
@@ -487,7 +600,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
   // rewrite fetch, XMLHttpRequest, EventSource
   private patchRequestApi (appName: string, url: string, microAppWindow: microAppWindowType): void {
     let microFetch = createMicroFetch(url)
-    let microXMLHttpRequest = createMicroXMLHttpRequest(url)
+    let microXMLHttpRequest = createMicroXMLHttpRequest(url, undefined, this.requestScope)
     let microEventSource = createMicroEventSource(appName, url)
 
     rawDefineProperties(microAppWindow, {
@@ -508,7 +621,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
           return microXMLHttpRequest
         },
         set (value) {
-          microXMLHttpRequest = createMicroXMLHttpRequest(url, value)
+          microXMLHttpRequest = createMicroXMLHttpRequest(url, value, this.requestScope)
         },
       },
       EventSource: {
@@ -542,7 +655,7 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
     const { microLocation, microHistory } = createMicroRouter(appName, url)
     rawDefineProperties(microAppWindow, {
       location: {
-        configurable: false,
+        configurable: true,
         enumerable: true,
         get () {
           return microLocation
@@ -616,6 +729,11 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
     handleUmdHooks: Func,
   ): () => void {
     let mount: Func | null, unmount: Func | null, microAppLibrary: Record<string, unknown> | null
+    const hookKeys = ['mount', 'unmount', `micro-app-${appName}`]
+    const originalDescriptors = new Map<PropertyKey, PropertyDescriptor | undefined>(
+      hookKeys.map((key) => [key, Object.getOwnPropertyDescriptor(microAppWindow, key)]),
+    )
+    let cleared = false
     rawDefineProperties(microAppWindow, {
       mount: {
         configurable: true,
@@ -648,7 +766,17 @@ export default class WithSandBox extends BaseSandbox implements WithSandBoxInter
     })
 
     return () => {
+      if (cleared) return
+      cleared = true
       mount = unmount = microAppLibrary = null
+      originalDescriptors.forEach((descriptor, key) => {
+        if (descriptor) {
+          rawDefineProperty(microAppWindow, key, descriptor)
+        } else {
+          Reflect.deleteProperty(microAppWindow, key)
+        }
+      })
+      originalDescriptors.clear()
     }
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "@micro-zoe/micro-app",
-  "version": "1.0.0-rc.32",
+  "version": "2.0.0-rc.1",
   "description": "A lightweight, efficient and powerful micro front-end framework",
   "private": false,
   "main": "lib/index.min.js",
@@ -40,7 +40,7 @@
     "docs": "docsify serve docs --port 2000",
     "lint": "eslint --cache '**/*.{js,ts}'",
     "lint:fix": "yarn lint --fix",
-    "createtype": "node scripts/create_type.js",
+    "createtype": "tsc --emitDeclarationOnly --declaration --outDir lib/lib --types node && node scripts/create_type.js",
     "afterbuild": "node scripts/after_build.js",
     "test:server": "node scripts/test_server.js --start",
     "test": "jest",

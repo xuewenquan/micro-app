@@ -19,6 +19,8 @@ import {
 import {
   updateElementInfo,
 } from '../adapter'
+import createListenerEffect from '../listener_effect'
+import { retainSandboxDom7Cleanup } from '../event_target'
 
 /**
  * create proxyDocument and MicroDocument, rewrite document of child app
@@ -32,10 +34,17 @@ export function patchDocument (
   sandbox: WithSandBoxInterface,
 ): CommonEffectHook {
   const { proxyDocument, documentEffect } = createProxyDocument(appName, sandbox)
-  const MicroDocument = createMicroDocument(appName, proxyDocument)
+  const { MicroDocument, dispose: disposeMicroDocument } = createMicroDocument(appName, proxyDocument)
+  const disposeDocumentEffect = documentEffect.dispose
+  documentEffect.dispose = () => {
+    disposeMicroDocument()
+    disposeDocumentEffect?.()
+  }
   rawDefineProperties(microAppWindow, {
     document: {
-      configurable: false,
+      // This is a synthetic Window. Keep the descriptor removable so terminal
+      // destroy can sever the proxyDocument closure and release child code.
+      configurable: true,
       enumerable: true,
       get () {
         // return globalEnv.rawDocument
@@ -43,7 +52,7 @@ export function patchDocument (
       },
     },
     Document: {
-      configurable: false,
+      configurable: true,
       enumerable: false,
       get () {
         // return globalEnv.rawRootDocument
@@ -65,8 +74,12 @@ function createProxyDocument (
     proxyDocument: Document,
     documentEffect: CommonEffectHook,
   } {
-  const eventListenerMap = new Map<string, Set<MicroEventListener>>()
-  const sstEventListenerMap = new Map<string, Set<MicroEventListener>>()
+  // Keep the proxy stable for code that cached `document`. Revoking it during
+  // Vue/React teardown turns otherwise harmless late reads into a TypeError.
+  // Mutable state is cleared by dispose so a retained proxy cannot retain the
+  // application sandbox or continue attributing work to a destroyed app.
+  let currentAppName: string | null = appName
+  let currentSandbox: WithSandBoxInterface | null = sandbox
   let onClickHandler: unknown = null
   let sstOnClickHandler: unknown = null
   const {
@@ -76,13 +89,15 @@ function createProxyDocument (
     rawAddEventListener,
     rawRemoveEventListener,
   } = globalEnv
+  const listenerEffect = createListenerEffect(rawAddEventListener, rawRemoveEventListener,
+    (record) => retainSandboxDom7Cleanup(appName, record))
 
   function createElement (
     tagName: string,
     options?: ElementCreationOptions,
   ): HTMLElement {
     const element = rawCreateElement.call(rawDocument, tagName, options)
-    return updateElementInfo(element, appName)
+    return currentAppName ? updateElementInfo(element, currentAppName) : element
   }
 
   function createElementNS (
@@ -91,7 +106,7 @@ function createProxyDocument (
     options?: string | ElementCreationOptions,
   ): HTMLElement {
     const element = rawCreateElementNS.call(rawDocument, namespaceURI, name, options)
-    return updateElementInfo(element, appName)
+    return currentAppName ? updateElementInfo(element, currentAppName) : element
   }
 
   /**
@@ -105,14 +120,7 @@ function createProxyDocument (
     listener: MicroEventListener,
     options?: boolean | AddEventListenerOptions
   ): void {
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList) {
-      listenerList.add(listener)
-    } else {
-      eventListenerMap.set(type, new Set([listener]))
-    }
-    listener && (listener.__MICRO_APP_MARK_OPTIONS__ = options)
-    rawAddEventListener.call(rawDocument, type, listener, options)
+    listenerEffect.add(rawDocument, type, listener, options)
   }
 
   function removeEventListener (
@@ -120,16 +128,12 @@ function createProxyDocument (
     listener: MicroEventListener,
     options?: boolean | AddEventListenerOptions,
   ): void {
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList?.size && listenerList.has(listener)) {
-      listenerList.delete(listener)
-    }
-    rawRemoveEventListener.call(rawDocument, type, listener, options)
+    listenerEffect.remove(rawDocument, type, listener, options)
   }
 
   // reset snapshot data
   const reset = (): void => {
-    sstEventListenerMap.clear()
+    listenerEffect.reset()
     sstOnClickHandler = null
   }
 
@@ -151,12 +155,7 @@ function createProxyDocument (
     sstOnClickHandler = onClickHandler || sstOnClickHandler
 
     // record document event
-    eventListenerMap.forEach((listenerList, type) => {
-      if (listenerList.size) {
-        const cacheList = sstEventListenerMap.get(type) || []
-        sstEventListenerMap.set(type, new Set([...cacheList, ...listenerList]))
-      }
-    })
+    listenerEffect.record()
   }
 
   // rebuild event and timer before remount app
@@ -165,13 +164,9 @@ function createProxyDocument (
     if (sstOnClickHandler && !onClickHandler) proxyDocument.onclick = sstOnClickHandler
 
     // rebuild document event
-    sstEventListenerMap.forEach((listenerList, type) => {
-      for (const listener of listenerList) {
-        proxyDocument.addEventListener(type, listener, listener?.__MICRO_APP_MARK_OPTIONS__)
-      }
+    listenerEffect.rebuild((record) => {
+      proxyDocument.addEventListener(record.type, record.listener, record.options)
     })
-
-    reset()
   }
 
   // release all event listener & interval & timeout when unmount app
@@ -183,14 +178,7 @@ function createProxyDocument (
     onClickHandler = null
 
     // Clear document binding event
-    if (eventListenerMap.size) {
-      eventListenerMap.forEach((listenerList, type) => {
-        for (const listener of listenerList) {
-          rawRemoveEventListener.call(rawDocument, type, listener)
-        }
-      })
-      eventListenerMap.clear()
-    }
+    listenerEffect.release()
   }
 
   const genProxyDocumentProps = () => {
@@ -221,20 +209,21 @@ function createProxyDocument (
 
   const proxyDocument = new Proxy(rawDocument, {
     get: (target: Document, key: PropertyKey): unknown => {
-      throttleDeferForSetAppName(appName)
+      if (currentAppName) throttleDeferForSetAppName(currentAppName)
       // TODO: 转换成数据形式，类似iframe的方式
       if (key === 'createElement') return createElement
       if (key === 'createElementNS') return createElementNS
       if (key === Symbol.toStringTag) return 'ProxyDocument'
-      if (key === 'defaultView') return sandbox.proxyWindow
+      if (key === 'defaultView') return currentSandbox?.proxyWindow || rawDocument.defaultView
       if (key === 'onclick') return onClickHandler
       if (key === 'addEventListener') return addEventListener
       if (key === 'removeEventListener') return removeEventListener
-      if (key === 'microAppElement') return appInstanceMap.get(appName)?.container
-      if (key === '__MICRO_APP_NAME__') return appName
+      if (key === 'microAppElement') return currentAppName ? appInstanceMap.get(currentAppName)?.container : null
+      if (key === '__MICRO_APP_NAME__') return currentAppName
       return bindFunctionToRawTarget<Document>(Reflect.get(target, key), rawDocument, 'DOCUMENT')
     },
     set: (target: Document, key: PropertyKey, value: unknown): boolean => {
+      if (!currentSandbox) return true // Do not mutate base document after destroy.
       if (mergedProxyDocumentProps.has(key)) {
         const proxyCallback = mergedProxyDocumentProps.get(key)
         proxyCallback(value)
@@ -256,6 +245,13 @@ function createProxyDocument (
       record,
       rebuild,
       release,
+      dispose: () => {
+        listenerEffect.dispose()
+        currentAppName = null
+        currentSandbox = null
+        onClickHandler = null
+        sstOnClickHandler = null
+      },
     }
   }
 }
@@ -266,8 +262,18 @@ function createProxyDocument (
  * @param proxyDocument proxy(document)
  * @returns Document
  */
-function createMicroDocument (appName: string, proxyDocument: Document): Function {
+function createMicroDocument (
+  appName: string,
+  proxyDocument: Document,
+): {
+    MicroDocument: Function,
+    dispose: () => void,
+  } {
   const { rawDocument, rawRootDocument } = globalEnv
+  let currentProxyDocument: Document | null = proxyDocument
+  let currentAppName: string | null = appName
+  let disposed = false
+  const ignoreLateListener = () => {}
 
   class MicroDocument {
     static [Symbol.hasInstance] (target: unknown) {
@@ -279,7 +285,7 @@ function createMicroDocument (appName: string, proxyDocument: Document): Functio
         }
       }
       return (
-        target === proxyDocument ||
+        target === currentProxyDocument ||
         target instanceof rawRootDocument
       )
     }
@@ -296,16 +302,33 @@ function createMicroDocument (appName: string, proxyDocument: Document): Functio
    */
   Object.setPrototypeOf(MicroDocument, rawRootDocument)
   // Object.create(rawRootDocument.prototype) will cause MicroDocument and proxyDocument methods not same when exec Document.prototype.xxx = xxx in child app
-  Object.setPrototypeOf(MicroDocument.prototype, new Proxy(rawRootDocument.prototype, {
+  const prototypeProxy = new Proxy(rawRootDocument.prototype, {
     get (target: Document, key: PropertyKey): unknown {
-      throttleDeferForSetAppName(appName)
+      if (currentAppName) throttleDeferForSetAppName(currentAppName)
+      // Route prototype access through the same effect wrappers. A function
+      // cached before destroy must not bypass disposed listener bookkeeping.
+      if (key === 'addEventListener') return currentProxyDocument?.addEventListener || ignoreLateListener
+      if (key === 'removeEventListener' && currentProxyDocument) return currentProxyDocument.removeEventListener
       return bindFunctionToRawTarget<Document>(Reflect.get(target, key), rawDocument, 'DOCUMENT')
     },
     set (target: Document, key: PropertyKey, value: unknown): boolean {
+      if (!currentAppName) return true
       Reflect.set(target, key, value)
       return true
     }
-  }))
+  })
+  Object.setPrototypeOf(MicroDocument.prototype, prototypeProxy)
 
-  return MicroDocument
+  return {
+    MicroDocument,
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      currentProxyDocument = null
+      currentAppName = null
+      // Detach the per-app proxy. Do not revoke it: framework teardown can still
+      // hold a reference to the old prototype and is allowed to read it safely.
+      Object.setPrototypeOf(MicroDocument.prototype, rawRootDocument.prototype)
+    },
+  }
 }

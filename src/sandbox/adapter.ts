@@ -12,12 +12,24 @@ import {
   throttleDeferForIframeAppName,
   isAnchorElement,
 } from '../libs/utils'
+
 import {
   appInstanceMap,
   isIframeSandbox,
 } from '../create_app'
 import microApp from '../micro_app'
 import { AppManager } from '../app_manager'
+
+/**
+ * NOTE(已知风险) 2026.9.12 by Claude Code
+ * 这是模块级强引用 Map，保存 iframe 沙箱 patch 过的**每一个 DOM 节点**。
+ * 它只会被 releaseElementInfoTree(appName) 清空，而该函数只在 IframeSandbox.destroy()
+ * 里被调用。因此一旦某条销毁路径没走到 destroy（例如 sandBox 实例已被 clearOptions
+ * 置空，或 sandbox.destroy() 中途抛异常），这里就会永久持有该应用整棵 DOM。
+ * 已加的两道保险：CreateApp.actionsForCompletelyDestroy 中的兜底调用、
+ * IframeSandbox.destroy 的 try/catch/finally。新增销毁路径时请一并确认。
+ */
+const iframeAppNodeMap = new Map<string, Set<Node>>()
 
 export class BaseSandbox implements BaseSandboxType {
   constructor (appName: string, url: string) {
@@ -42,6 +54,11 @@ export class BaseSandbox implements BaseSandboxType {
     'webpackJsonp',
     'webpackHotUpdate',
     'Vue',
+    // Vue 3 registers runtime setters in arrays on globalThis and never removes
+    // them. Sharing the base-window arrays lets one child runtime retain every
+    // destroyed child sandbox through its setter closures.
+    '__VUE_INSTANCE_SETTERS__',
+    '__VUE_SSR_SETTERS__',
     // TODO: 是否可以和constants/SCOPE_WINDOW_ON_EVENT合并
     'onpopstate',
     'onhashchange',
@@ -128,6 +145,52 @@ export function patchElementTree (
 }
 
 /**
+ * Remove instance-level DOM adapters before terminal iframe destruction.
+ * Detached nodes can be retained temporarily by VNodes or browser tooling; leaving
+ * one closure set on every node makes that temporary retention unnecessarily large.
+ */
+export function releaseElementInfoTree (container: Node | null, appName: string): void {
+  const trackedNodes = iframeAppNodeMap.get(appName)
+  const pendingNodes: Node[] = trackedNodes
+    ? Array.from(trackedNodes)
+    : (container ? [container] : [])
+  const visitedNodes = new Set<Node>()
+  const patchedKeys = [
+    '__MICRO_APP_NAME__',
+    'baseURI',
+    'ownerDocument',
+    'parentNode',
+    'getRootNode',
+    'href',
+  ]
+
+  while (pendingNodes.length) {
+    const node = pendingNodes.pop()!
+    if (visitedNodes.has(node)) continue
+    visitedNodes.add(node)
+    // The registry already contains every iframe node. Only use a sibling walk
+    // as a compatibility fallback; reading childNodes creates a cached NodeList
+    // for every node in Chromium and can itself retain a large native graph.
+    if (!trackedNodes) {
+      let child = node.firstChild
+      while (child) {
+        pendingNodes.push(child)
+        child = child.nextSibling
+      }
+    }
+    if (node.__MICRO_APP_NAME__ === appName) {
+      patchedKeys.forEach((key) => Reflect.deleteProperty(node, key))
+      // Review correction: do not delete Vue's private VNode/invoker fields.
+      // DOM -> VNode deletion does not fix VNode -> DOM retention and can break
+      // late framework teardown. Only micro-app-owned adapters are removed here.
+    }
+  }
+
+  trackedNodes?.clear()
+  iframeAppNodeMap.delete(appName)
+}
+
+/**
  * rewrite baseURI, ownerDocument, __MICRO_APP_NAME__ of target node
  * @param node target node
  * @param appName app name
@@ -188,20 +251,25 @@ export function updateElementInfo <T> (node: T, appName: string | null): T {
      *  5. Node.prototype.cloneNode
      *  6. Element.prototype.innerHTML
      *  7. Image
-     */
+    */
     if (isIframeSandbox(appName)) {
-      const proxyWindow = appInstanceMap.get(appName)?.sandBox?.proxyWindow
-      if (proxyWindow) {
+      const trackedNodes = iframeAppNodeMap.get(appName) || new Set<Node>()
+      trackedNodes.add(node)
+      iframeAppNodeMap.set(appName, trackedNodes)
+      if (appInstanceMap.get(appName)?.sandBox?.proxyWindow) {
         rawDefineProperties(node, {
           baseURI: {
             configurable: true,
             enumerable: true,
-            get: () => proxyWindow.location.href,
+            get: () => appInstanceMap.get(appName)?.sandBox?.proxyWindow?.location.href || globalEnv.rawDocument.baseURI,
           },
           ownerDocument: {
             configurable: true,
             enumerable: true,
-            get: () => node !== proxyWindow.document ? proxyWindow.document : null,
+            get () {
+              const proxyDocument = appInstanceMap.get(appName)?.sandBox?.proxyWindow?.document
+              return this !== proxyDocument ? proxyDocument || null : null
+            },
           },
           parentNode: getIframeParentNodeDesc(
             appName,
@@ -212,7 +280,7 @@ export function updateElementInfo <T> (node: T, appName: string | null): T {
             enumerable: true,
             writable: true,
             value: function getRootNode (): Node {
-              return proxyWindow.document
+              return appInstanceMap.get(appName)?.sandBox?.proxyWindow?.document || globalEnv.rawDocument
             }
           },
         })

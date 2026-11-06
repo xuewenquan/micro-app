@@ -5,7 +5,7 @@ import type {
   timeInfo,
   WithSandBoxInterface,
 } from '@micro-app/types'
-import globalEnv from '../../libs/global_env'
+import globalEnv, { snapshotRawGlobalObjectProperties } from '../../libs/global_env'
 import bindFunctionToRawTarget from '../bind_function'
 import {
   SCOPE_WINDOW_EVENT_OF_WITH,
@@ -22,11 +22,19 @@ import {
   removeDomScope,
   getRootContainer,
   formatEventType,
+  isFunction,
+  isConstructor,
 } from '../../libs/utils'
 import {
   appInstanceMap,
 } from '../../create_app'
 import WorkerProxy from '../../proxies/worker'
+import { patchMatchMedia, patchObserverConstructors } from '../observer'
+import createListenerEffect from '../listener_effect'
+import { createResourceFactoryScope } from '../resource_factory'
+import { createTrustedTypesScope } from '../trusted_types'
+import { retainSandboxDom7Cleanup } from '../event_target'
+import { patchAnimationFrame } from '../animation_frame'
 
 /**
  * patch window of child app
@@ -41,8 +49,14 @@ export function patchWindow (
   sandbox: WithSandBoxInterface,
 ): CommonEffectHook {
   patchWindowProperty(microAppWindow)
-  createProxyWindow(appName, microAppWindow, sandbox)
-  return patchWindowEffect(microAppWindow, appName)
+  const disposeProxyWindow = createProxyWindow(appName, microAppWindow, sandbox)
+  const effect = patchWindowEffect(microAppWindow, appName)
+  const disposeEffect = effect.dispose
+  effect.dispose = () => {
+    disposeEffect?.()
+    disposeProxyWindow()
+  }
+  return effect
 }
 
 /**
@@ -81,12 +95,16 @@ function patchWindowProperty (
  * @param sandbox WithSandBox
  */
 function createProxyWindow (
-  appName: string,
+  initialAppName: string,
   microAppWindow: microAppWindowType,
-  sandbox: WithSandBoxInterface,
-): void {
+  initialSandbox: WithSandBoxInterface,
+): () => void {
   const rawWindow = globalEnv.rawWindow
-  const descriptorTargetMap = new Map<PropertyKey, 'target' | 'rawWindow'>()
+  let appName: string | null = initialAppName
+  let sandbox: WithSandBoxInterface | null = initialSandbox
+  const ignoreLateEffect = () => 0
+  const resourceFactories = createResourceFactoryScope()
+  const trustedTypes = createTrustedTypesScope()
 
   rawDefineProperty(microAppWindow, 'Worker', {
     value: WorkerProxy,
@@ -94,9 +112,20 @@ function createProxyWindow (
     writable: true,
   })
 
+  // Like document, window must remain readable by cached framework teardown.
+  // Dispose severs mutable sandbox context instead of revoking the Proxy.
   const proxyWindow = new Proxy(microAppWindow, {
     get: (target: microAppWindowType, key: PropertyKey): unknown => {
-      throttleDeferForSetAppName(appName)
+      // A registered native policy outlives its child. Its callback must not.
+      if (key === 'trustedTypes') return trustedTypes.wrap(Reflect.get(target, key) ?? rawWindow.trustedTypes)
+      if (!sandbox) {
+        if (includes(['window', 'self', 'globalThis', 'parent', 'top'], key)) return proxyWindow
+        if (includes(['addEventListener', 'setTimeout', 'setInterval', 'requestAnimationFrame', 'requestIdleCallback'], key)) return ignoreLateEffect
+        // Cached child callbacks can re-read globalPlugin after destruction.
+        // Keep factory ownership guards on this late-read path as well.
+        return resourceFactories.wrap(bindFunctionToRawTarget(Reflect.get(target, key) ?? Reflect.get(rawWindow, key), rawWindow))
+      }
+      if (appName) throttleDeferForSetAppName(appName)
       // return WorkerProxy if child app accesses window.Worker
       if (key === 'Worker') {
         return WorkerProxy
@@ -107,12 +136,17 @@ function createProxyWindow (
         includes(sandbox.scopeProperties, key)
       ) {
         if (includes(RAW_GLOBAL_TARGET, key)) removeDomScope()
-        return Reflect.get(target, key)
+        return resourceFactories.wrap(Reflect.get(target, key))
       }
 
-      return bindFunctionToRawTarget(Reflect.get(rawWindow, key), rawWindow)
+      const rawValue = Reflect.get(rawWindow, key)
+      if (isFunction(rawValue) && rawValue.prototype) {
+        snapshotRawGlobalObjectProperties(rawValue, rawValue.prototype)
+      }
+      return resourceFactories.wrap(bindFunctionToRawTarget(rawValue, rawWindow))
     },
     set: (target: microAppWindowType, key: PropertyKey, value: unknown): boolean => {
+      if (!sandbox) return true // Late child writes must not escape to the base.
       if (includes(sandbox.rawWindowScopeKeyList, key)) {
         Reflect.set(rawWindow, key, value)
       } else if (
@@ -158,6 +192,7 @@ function createProxyWindow (
       return true
     },
     has: (target: microAppWindowType, key: PropertyKey): boolean => {
+      if (!sandbox) return Reflect.has(target, key) || Reflect.has(rawWindow, key)
       /**
        * Some keywords, such as Vue, need to meet two conditions at the same time:
        * 1. window.Vue --> undefined
@@ -175,12 +210,10 @@ function createProxyWindow (
     // Object.getOwnPropertyDescriptor(window, key)
     getOwnPropertyDescriptor: (target: microAppWindowType, key: PropertyKey): PropertyDescriptor|undefined => {
       if (rawHasOwnProperty.call(target, key)) {
-        descriptorTargetMap.set(key, 'target')
         return Object.getOwnPropertyDescriptor(target, key)
       }
 
       if (rawHasOwnProperty.call(rawWindow, key)) {
-        descriptorTargetMap.set(key, 'rawWindow')
         const descriptor = Object.getOwnPropertyDescriptor(rawWindow, key)
         if (descriptor && !descriptor.configurable) {
           descriptor.configurable = true
@@ -192,17 +225,37 @@ function createProxyWindow (
     },
     // Object.defineProperty(window, key, Descriptor)
     defineProperty: (target: microAppWindowType, key: PropertyKey, value: PropertyDescriptor): boolean => {
-      const from = descriptorTargetMap.get(key)
-      if (from === 'rawWindow') {
+      if (!sandbox) return Reflect.defineProperty(target, key, value)
+      if (includes(sandbox.rawWindowScopeKeyList, key)) {
         return Reflect.defineProperty(rawWindow, key, value)
       }
-      return Reflect.defineProperty(target, key, value)
+
+      const result = Reflect.defineProperty(target, key, value)
+      if (!result) return false
+
+      sandbox.injectedKeys.add(key)
+      if (
+        (
+          includes(sandbox.escapeProperties, key) ||
+          (
+            includes(sandbox.staticEscapeProperties, key) &&
+            !Reflect.has(rawWindow, key)
+          )
+        ) &&
+        !includes(sandbox.scopeProperties, key)
+      ) {
+        !Reflect.has(rawWindow, key) && sandbox.escapeKeys.add(key)
+        return Reflect.defineProperty(rawWindow, key, value)
+      }
+
+      return true
     },
     // Object.getOwnPropertyNames(window)
     ownKeys: (target: microAppWindowType): Array<string | symbol> => {
       return unique(Reflect.ownKeys(rawWindow).concat(Reflect.ownKeys(target)))
     },
     deleteProperty: (target: microAppWindowType, key: PropertyKey): boolean => {
+      if (!sandbox) return Reflect.deleteProperty(target, key)
       if (rawHasOwnProperty.call(target, key)) {
         sandbox.injectedKeys.has(key) && sandbox.injectedKeys.delete(key)
         sandbox.escapeKeys.has(key) && Reflect.deleteProperty(rawWindow, key)
@@ -212,7 +265,13 @@ function createProxyWindow (
     },
   })
 
-  sandbox.proxyWindow = proxyWindow
+  initialSandbox.proxyWindow = proxyWindow
+  return () => {
+    trustedTypes.dispose()
+    resourceFactories.dispose()
+    sandbox = null
+    appName = null
+  }
 }
 
 /**
@@ -220,10 +279,9 @@ function createProxyWindow (
  * @param microAppWindow micro window
  */
 function patchWindowEffect (microAppWindow: microAppWindowType, appName: string): CommonEffectHook {
-  const eventListenerMap = new Map<string, Set<MicroEventListener>>()
-  const sstEventListenerMap = new Map<string, Set<MicroEventListener>>()
   const intervalIdMap = new Map<number, timeInfo>()
   const timeoutIdMap = new Map<number, timeInfo>()
+  const webSocketSet = new Set<WebSocket>()
   const {
     rawWindow,
     rawAddEventListener,
@@ -234,6 +292,27 @@ function patchWindowEffect (microAppWindow: microAppWindowType, appName: string)
     rawClearInterval,
     rawClearTimeout,
   } = globalEnv
+  const releaseObservers = patchObserverConstructors(microAppWindow, rawWindow)
+  const releaseMediaQueryListeners = patchMatchMedia(microAppWindow, rawWindow)
+  const animationFrames = patchAnimationFrame(microAppWindow, rawWindow)
+  const RawWebSocket = rawWindow.WebSocket
+  const listenerEffect = createListenerEffect(rawAddEventListener, rawRemoveEventListener,
+    (record) => retainSandboxDom7Cleanup(appName, record))
+
+  if (isConstructor(RawWebSocket)) {
+    rawDefineProperty(microAppWindow, 'WebSocket', {
+      configurable: true,
+      writable: true,
+      value: new Proxy(RawWebSocket, {
+        construct (Target, args, NewTarget) {
+          const socket = Reflect.construct(Target, args, NewTarget) as WebSocket
+          webSocketSet.add(socket)
+          socket.addEventListener('close', () => webSocketSet.delete(socket), { once: true })
+          return socket
+        },
+      }),
+    })
+  }
 
   /**
    * All events will bind to microAppElement or rawWindow
@@ -263,14 +342,7 @@ function patchWindowEffect (microAppWindow: microAppWindowType, appName: string)
     options?: boolean | AddEventListenerOptions,
   ): void {
     type = formatEventType(type, appName)
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList) {
-      listenerList.add(listener)
-    } else {
-      eventListenerMap.set(type, new Set([listener]))
-    }
-    listener && (listener.__MICRO_APP_MARK_OPTIONS__ = options)
-    rawAddEventListener.call(getEventTarget(type), type, listener, options)
+    listenerEffect.add(getEventTarget(type), type, listener, options)
   }
 
   microAppWindow.removeEventListener = function (
@@ -279,11 +351,7 @@ function patchWindowEffect (microAppWindow: microAppWindowType, appName: string)
     options?: boolean | AddEventListenerOptions,
   ): void {
     type = formatEventType(type, appName)
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList?.size && listenerList.has(listener)) {
-      listenerList.delete(listener)
-    }
-    rawRemoveEventListener.call(getEventTarget(type), type, listener, options)
+    listenerEffect.remove(getEventTarget(type), type, listener, options)
   }
 
   microAppWindow.dispatchEvent = function (event: Event): boolean {
@@ -327,7 +395,7 @@ function patchWindowEffect (microAppWindow: microAppWindowType, appName: string)
 
   // reset snapshot data
   const reset = (): void => {
-    sstEventListenerMap.clear()
+    listenerEffect.reset()
   }
 
   /**
@@ -342,40 +410,27 @@ function patchWindowEffect (microAppWindow: microAppWindowType, appName: string)
    */
   const record = (): void => {
     // record window event
-    eventListenerMap.forEach((listenerList, type) => {
-      if (listenerList.size) {
-        const cacheList = sstEventListenerMap.get(type) || []
-        sstEventListenerMap.set(type, new Set([...cacheList, ...listenerList]))
-      }
-    })
+    listenerEffect.record()
   }
 
   // rebuild event and timer before remount app
   const rebuild = (): void => {
     // rebuild window event
-    sstEventListenerMap.forEach((listenerList, type) => {
-      for (const listener of listenerList) {
-        microAppWindow.addEventListener(type, listener, listener?.__MICRO_APP_MARK_OPTIONS__)
-      }
+    listenerEffect.rebuild((record) => {
+      microAppWindow.addEventListener(record.type, record.listener, record.options)
     })
-
-    reset()
   }
 
   // release all event listener & interval & timeout when unmount app
   const release = (clearTimer: boolean): void => {
+    animationFrames.release(clearTimer)
+    releaseMediaQueryListeners(clearTimer)
     // Clear window binding events
-    if (eventListenerMap.size) {
-      eventListenerMap.forEach((listenerList, type) => {
-        for (const listener of listenerList) {
-          rawRemoveEventListener.call(getEventTarget(type), type, listener)
-        }
-      })
-      eventListenerMap.clear()
-    }
+    listenerEffect.release()
 
     // default mode(not keep-alive or isPrerender)
     if (clearTimer) {
+      releaseObservers(true)
       intervalIdMap.forEach((_, intervalId: number) => {
         rawClearInterval.call(rawWindow, intervalId)
       })
@@ -386,6 +441,14 @@ function patchWindowEffect (microAppWindow: microAppWindowType, appName: string)
 
       intervalIdMap.clear()
       timeoutIdMap.clear()
+      webSocketSet.forEach((socket) => {
+        try {
+          socket.close()
+        } catch (_) {
+          // Ignore sockets that have already entered a terminal native state.
+        }
+      })
+      webSocketSet.clear()
     }
   }
 
@@ -394,5 +457,9 @@ function patchWindowEffect (microAppWindow: microAppWindowType, appName: string)
     record,
     rebuild,
     release,
+    dispose () {
+      animationFrames.dispose()
+      listenerEffect.dispose()
+    },
   }
 }

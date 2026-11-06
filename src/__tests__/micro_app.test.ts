@@ -6,6 +6,7 @@ import {
   jestConsoleError,
 } from './common/initial'
 import microApp from '..'
+import { appInstanceMap } from '../create_app'
 
 describe('micro_app', () => {
   let appCon: Element
@@ -63,6 +64,34 @@ describe('micro_app', () => {
     microApp.unmountAllApps().then(() => {
       expect(microApp.getActiveApps().includes('test-app1')).toBeFalsy()
     })
+  })
+
+  test('terminally unmounts an active app after its host element was removed', async () => {
+    const name = 'active-app-without-host'
+    const unmount = jest.fn((options) => options.unmountcb?.())
+    const app = {
+      container: null,
+      isPrefetch: false,
+      isPrerender: false,
+      isUnmounted: () => false,
+      isHidden: () => false,
+      unmount,
+    }
+
+    appInstanceMap.set(name, app as any)
+    try {
+      await expect(microApp.unmountApp(name, {
+        destroy: true,
+        clearData: true,
+      })).resolves.toBe(true)
+      expect(unmount).toHaveBeenCalledWith(expect.objectContaining({
+        destroy: true,
+        clearData: true,
+        keepRouteState: false,
+      }))
+    } finally {
+      appInstanceMap.delete(name)
+    }
   })
 
   // 在不支持customElements的环境下打印错误信息

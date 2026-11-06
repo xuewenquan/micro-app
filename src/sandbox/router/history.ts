@@ -32,6 +32,7 @@ import {
 } from './core'
 import {
   dispatchNativeEvent,
+  updateMicroLocationWithEvent,
 } from './event'
 import {
   updateMicroLocation,
@@ -43,6 +44,33 @@ import {
   appInstanceMap,
   isIframeSandbox,
 } from '../../create_app'
+
+const pendingSearchRouteSync = new Map<string, number>()
+
+/**
+ * Vue Router and other base routers may call replaceState several times for a
+ * single navigation. Dispatching every intermediate URL to a search-mode child
+ * makes it navigate through stale routes (for example guide -> target). Coalesce
+ * those writes and publish only the URL left at the end of the current task.
+ */
+function scheduleSearchRouteSync (appName: string): void {
+  const rawWindow = globalEnv.rawWindow
+  const pendingTimer = pendingSearchRouteSync.get(appName)
+  if (pendingTimer !== undefined) globalEnv.rawClearTimeout.call(rawWindow, pendingTimer)
+
+  const timer = globalEnv.rawSetTimeout.call(rawWindow, () => {
+    pendingSearchRouteSync.delete(appName)
+    const app = appInstanceMap.get(appName)
+    if (!app || app.isUnmounted() || app.isHidden() || app.isPrefetch || app.isPrerender) return
+
+    const targetFullPath = getMicroPathFromURL(appName)
+    const currentFullPath = app.sandBox?.proxyWindow?.location?.fullPath
+    if (targetFullPath && targetFullPath !== currentFullPath) {
+      updateMicroLocationWithEvent(appName, targetFullPath)
+    }
+  }, 0)
+  pendingSearchRouteSync.set(appName, timer)
+}
 
 /**
  * create proxyHistory for microApp
@@ -221,13 +249,20 @@ function reWriteHistoryMethod (method: History['pushState' | 'replaceState']): C
       excludeHiddenApp: true,
       excludePreRender: true,
     }).forEach(appName => {
+      const app = appInstanceMap.get(appName)!
       if ((isRouterModeSearch(appName) || isRouterModeState(appName)) && !getMicroPathFromURL(appName)) {
-        const app = appInstanceMap.get(appName)!
         attachRouteToBrowserURL(
           appName,
           setMicroPathToURL(appName, app.sandBox.proxyWindow.location),
           setMicroState(appName, getMicroState(appName), app.sandBox.proxyWindow.location),
         )
+      }
+
+      // A base-app router updates the address with native pushState/replaceState,
+      // which does not emit popstate. Synchronize the final changed route to an
+      // already mounted child instead of dispatching each router intermediate.
+      if (isRouterModeSearch(appName)) {
+        scheduleSearchRouteSync(appName)
       }
 
       if (isRouterModeCustom(appName) && !getMicroRouterInfoState(appName)) {
@@ -274,6 +309,10 @@ export function patchHistory (): void {
 
 export function releasePatchHistory (): void {
   const rawWindow = globalEnv.rawWindow
+  pendingSearchRouteSync.forEach((timer) => {
+    globalEnv.rawClearTimeout.call(rawWindow, timer)
+  })
+  pendingSearchRouteSync.clear()
   rawWindow.history.pushState = globalEnv.rawPushState
   rawWindow.history.replaceState = globalEnv.rawReplaceState
 }

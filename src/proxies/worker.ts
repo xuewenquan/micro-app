@@ -74,8 +74,7 @@ function urlFromScript(script: string) {
   return URL.createObjectURL(blob)
 }
 
-// @ts-ignore
-const WorkerProxy = new Proxy<Worker>(originalWorker, {
+const workerProxyHandler: ProxyHandler<Worker> = {
   construct(Target, args): WorkerInstance {
     let [scriptURL, options] = args
     options = options || {}
@@ -112,6 +111,13 @@ const WorkerProxy = new Proxy<Worker>(originalWorker, {
 
     return instance
   },
-})
+}
+
+// Worker is optional in jsdom, old browsers and restricted WebViews. Creating
+// Proxy(undefined, ...) fails while importing micro-app, before feature
+// detection in application code can run.
+const WorkerProxy = typeof originalWorker === 'function'
+  ? new Proxy<Worker>(originalWorker as unknown as Worker, workerProxyHandler)
+  : originalWorker
 
 export default WorkerProxy

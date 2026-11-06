@@ -44,10 +44,49 @@ export function createMicroFetch (url: string, target?: Window['fetch']): Window
  * @param url app url
  * @param target proxy target
  */
-export function createMicroXMLHttpRequest (url: string, target?: XMLHttpRequest): any {
+export interface XMLHttpRequestScope {
+  disposed: boolean
+  requests: Set<XMLHttpRequest>
+}
+
+export function createXMLHttpRequestScope (): XMLHttpRequestScope {
+  return { disposed: false, requests: new Set() }
+}
+
+export function disposeXMLHttpRequestScope (scope: XMLHttpRequestScope): void {
+  if (scope.disposed) return
+  scope.disposed = true
+  Array.from(scope.requests).forEach((request) => {
+    try { request.abort() } catch (error) {
+      console.warn(`[micro-app] XMLHttpRequest abort failed: ${String(error)}`)
+    } finally { scope.requests.delete(request) }
+  })
+}
+
+export function createMicroXMLHttpRequest (url: string, target?: XMLHttpRequest, scope?: XMLHttpRequestScope): any {
   const rawXMLHttpRequest = !isUndefined(target) ? target : globalEnv.rawWindow.XMLHttpRequest
   if (!isConstructor(rawXMLHttpRequest)) return rawXMLHttpRequest
   class MicroXMLHttpRequest extends rawXMLHttpRequest {
+    send (...args: unknown[]): void {
+      if (scope?.disposed) throw new Error('[micro-app] XMLHttpRequest belongs to a destroyed sandbox')
+      if (scope) {
+        const request = this as unknown as XMLHttpRequest
+        // A duplicate send must preserve the original in-flight registration
+        // when the native API rejects it with InvalidStateError.
+        if (scope.requests.has(request)) { super.send(...args); return }
+        scope.requests.add(request)
+        const complete = () => {
+          scope.requests.delete(request)
+          globalEnv.rawRemoveEventListener.call(this, 'loadend', complete, false)
+        }
+        globalEnv.rawAddEventListener.call(this, 'loadend', complete, false)
+        try { super.send(...args) } catch (error) {
+          complete()
+          throw error
+        }
+      } else super.send(...args)
+    }
+
     open (method: string, reqUrl: string, ...rests: unknown[]): void {
       if ((isString(reqUrl) && !/^f(ile|tp):\/\//.test(reqUrl)) || isURL(reqUrl)) {
         reqUrl = createURL(reqUrl, url).toString()

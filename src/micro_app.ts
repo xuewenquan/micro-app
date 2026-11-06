@@ -65,6 +65,10 @@ export function getAllApps (): string[] {
   return Array.from(appInstanceMap.keys())
 }
 
+// 2026.9.12 review: never dispatch fake mouse events during teardown. They run
+// legitimate base-app handlers and are not a reliable way to clear EventPath.
+// A click-outside library retaining its last event needs its own disposal hook.
+
 type unmountAppOptions = {
   destroy?: boolean // destroy app, default is false
   clearAliveState?: boolean // clear keep-alive app state, default is false
@@ -78,7 +82,8 @@ type unmountAppOptions = {
  * @returns Promise<void>
  */
 export function unmountApp (appName: string, options?: unmountAppOptions): Promise<boolean> {
-  const app = appInstanceMap.get(formatAppName(appName))
+  const formattedAppName = formatAppName(appName)
+  const app = appInstanceMap.get(formattedAppName)
   return new Promise((resolve) => {
     if (app) {
       if (app.isUnmounted() || app.isPrefetch) {
@@ -112,58 +117,83 @@ export function unmountApp (appName: string, options?: unmountAppOptions): Promi
           resolve(true)
         }
       } else {
-        const container = getRootContainer(app.container!)
-        const unmountHandler = () => {
-          container.removeEventListener(lifeCycles.UNMOUNT, unmountHandler)
-          container.removeEventListener(lifeCycles.AFTERHIDDEN, afterhiddenHandler)
-          resolve(true)
-        }
-
-        const afterhiddenHandler = () => {
-          container.removeEventListener(lifeCycles.UNMOUNT, unmountHandler)
-          container.removeEventListener(lifeCycles.AFTERHIDDEN, afterhiddenHandler)
-          resolve(true)
-        }
-
-        container.addEventListener(lifeCycles.UNMOUNT, unmountHandler)
-        container.addEventListener(lifeCycles.AFTERHIDDEN, afterhiddenHandler)
-
-        if (options?.destroy) {
-          let destroyAttrValue, destoryAttrValue
-          container.hasAttribute('destroy') && (destroyAttrValue = container.getAttribute('destroy'))
-          container.hasAttribute('destory') && (destoryAttrValue = container.getAttribute('destory'))
-
-          container.setAttribute('destroy', 'true')
-          container.parentNode!.removeChild(container)
-
-          container.removeAttribute('destroy')
-
-          isString(destroyAttrValue) && container.setAttribute('destroy', destroyAttrValue)
-          isString(destoryAttrValue) && container.setAttribute('destory', destoryAttrValue)
-        } else if (options?.clearAliveState && container.hasAttribute('keep-alive')) {
-          const keepAliveAttrValue = container.getAttribute('keep-alive')!
-          container.removeAttribute('keep-alive')
-
-          let clearDataAttrValue = null
-          if (options.clearData) {
-            clearDataAttrValue = container.getAttribute('clear-data')
-            container.setAttribute('clear-data', 'true')
-          }
-
-          container.parentNode!.removeChild(container)
-
-          container.setAttribute('keep-alive', keepAliveAttrValue)
-          isString(clearDataAttrValue) && container.setAttribute('clear-data', clearDataAttrValue)
+        const container = app.container && getRootContainer(app.container)
+        if (!container) {
+          // Vue/React may remove the host before the base app explicitly asks
+          // for terminal cleanup. The app can still be marked active during
+          // that gap, so unmount it directly instead of binding lifecycle
+          // listeners to a missing element.
+          app.unmount({
+            destroy: !!options?.destroy,
+            clearData: !!options?.clearData,
+            keepRouteState: false,
+            unmountcb: resolve.bind(null, true),
+          })
         } else {
-          let clearDataAttrValue = null
-          if (options?.clearData) {
-            clearDataAttrValue = container.getAttribute('clear-data')
-            container.setAttribute('clear-data', 'true')
+          const unmountHandler = () => {
+            container.removeEventListener(lifeCycles.UNMOUNT, unmountHandler)
+            container.removeEventListener(lifeCycles.AFTERHIDDEN, afterhiddenHandler)
+            resolve(true)
           }
 
-          container.parentNode!.removeChild(container)
+          const afterhiddenHandler = () => {
+            container.removeEventListener(lifeCycles.UNMOUNT, unmountHandler)
+            container.removeEventListener(lifeCycles.AFTERHIDDEN, afterhiddenHandler)
+            resolve(true)
+          }
 
-          isString(clearDataAttrValue) && container.setAttribute('clear-data', clearDataAttrValue)
+          container.addEventListener(lifeCycles.UNMOUNT, unmountHandler)
+          container.addEventListener(lifeCycles.AFTERHIDDEN, afterhiddenHandler)
+
+          if (options?.destroy) {
+            let destroyAttrValue, destoryAttrValue
+            container.hasAttribute('destroy') && (destroyAttrValue = container.getAttribute('destroy'))
+            container.hasAttribute('destory') && (destoryAttrValue = container.getAttribute('destory'))
+
+            container.setAttribute('destroy', 'true')
+            if (container.parentNode) {
+              container.parentNode.removeChild(container)
+            } else {
+              // A stale active record may already have lost its host element.
+              // Complete terminal teardown directly instead of rejecting and
+              // preventing unmountAllApps from processing subsequent apps.
+              app.unmount({
+                destroy: true,
+                clearData: !!options.clearData,
+                keepRouteState: false,
+                unmountcb: resolve.bind(null, true),
+              })
+            }
+
+            container.removeAttribute('destroy')
+
+            isString(destroyAttrValue) && container.setAttribute('destroy', destroyAttrValue)
+            isString(destoryAttrValue) && container.setAttribute('destory', destoryAttrValue)
+          } else if (options?.clearAliveState && container.hasAttribute('keep-alive')) {
+            const keepAliveAttrValue = container.getAttribute('keep-alive')!
+            container.removeAttribute('keep-alive')
+
+            let clearDataAttrValue = null
+            if (options.clearData) {
+              clearDataAttrValue = container.getAttribute('clear-data')
+              container.setAttribute('clear-data', 'true')
+            }
+
+            container.parentNode!.removeChild(container)
+
+            container.setAttribute('keep-alive', keepAliveAttrValue)
+            isString(clearDataAttrValue) && container.setAttribute('clear-data', clearDataAttrValue)
+          } else {
+            let clearDataAttrValue = null
+            if (options?.clearData) {
+              clearDataAttrValue = container.getAttribute('clear-data')
+              container.setAttribute('clear-data', 'true')
+            }
+
+            container.parentNode!.removeChild(container)
+
+            isString(clearDataAttrValue) && container.setAttribute('clear-data', clearDataAttrValue)
+          }
         }
       }
     } else {
@@ -175,7 +205,16 @@ export function unmountApp (appName: string, options?: unmountAppOptions): Promi
 
 // unmount all apps in turn
 export function unmountAllApps (options?: unmountAppOptions): Promise<boolean> {
-  return Array.from(appInstanceMap.keys()).reduce((pre, next) => pre.then(() => unmountApp(next, options)), Promise.resolve(true))
+  const tasks = Array.from(appInstanceMap.keys()).map(async (appName) => {
+    try {
+      return await unmountApp(appName, options)
+    } catch (e) {
+      logError(`An error occurred when unmount app ${appName} \n`, e)
+      return false
+    }
+  })
+
+  return Promise.all(tasks).then((results) => results.every(Boolean))
 }
 
 /**

@@ -29,6 +29,7 @@ export class HTMLLoader implements IHTMLLoader {
       ? Promise.resolve(`<micro-app-head><script src='${htmlUrl}'></script></micro-app-head><micro-app-body></micro-app-body>`)
       : fetchSource(htmlUrl, appName, { cache: 'no-cache' })
     htmlPromise.then((htmlStr: string) => {
+      if (app.isDestroyed?.()) return
       if (!htmlStr) {
         const msg = 'html is empty, please check in detail'
         app.onerror(new Error(msg))
@@ -39,6 +40,7 @@ export class HTMLLoader implements IHTMLLoader {
 
       successCb(htmlStr, app)
     }).catch((e) => {
+      if (app.isDestroyed?.()) return
       logError(`Failed to fetch data from ${app.url}, micro-app stop rendering`, appName, e)
       app.onLoadError(e)
     })

@@ -23,6 +23,18 @@ function createEventName (appName: string, fromBaseApp: boolean): string {
   return fromBaseApp ? `__${appName}_from_base_app__` : `__${appName}_from_micro_app__`
 }
 
+/**
+ * Permanently release the two app-specific data channels.
+ * Global data is deliberately preserved because it belongs to the base app.
+ */
+export function disposeDataCenterForApp (appName: string): void {
+  const formattedAppName = formatAppName(appName)
+  if (formattedAppName) {
+    eventCenter.dispose(createEventName(formattedAppName, true))
+    eventCenter.dispose(createEventName(formattedAppName, false))
+  }
+}
+
 // Global data
 class EventCenterForGlobal {
   /**

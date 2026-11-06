@@ -12,14 +12,12 @@ import {
 function formatEventInfo (event: CustomEvent, element: HTMLElement): void {
   Object.defineProperties(event, {
     currentTarget: {
-      get () {
-        return element
-      }
+      configurable: true,
+      value: element,
     },
     target: {
-      get () {
-        return element
-      }
+      configurable: true,
+      value: element,
     },
   })
 }

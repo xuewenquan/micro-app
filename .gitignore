@@ -22,3 +22,13 @@ logs
 # eslint
 .eslintcache
 .history
+
+.npmrc
+.gitattributes
+
+# local investigation artifacts
+.tmp/
+.npm-cache/
+.browser-profile-heap/
+heap-analysis/
+codex-session-*.md

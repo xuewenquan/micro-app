@@ -8,6 +8,7 @@ import type {
   AttrsType,
   microAppWindowType,
 } from '@micro-app/types'
+import { createAppTask } from '../libs/app_tasks'
 import { fetchSource } from './fetch'
 import {
   CompletionPath,
@@ -31,9 +32,16 @@ import {
   dispatchOnErrorEvent,
 } from './load_event'
 import microApp from '../micro_app'
-import globalEnv from '../libs/global_env'
+import globalEnv, {
+  beginRawGlobalObjectTracking,
+  finishRawGlobalObjectTracking,
+  releaseSharedFunctionToStringPatch,
+  releaseRawGlobalObjectPatches,
+} from '../libs/global_env'
 import { GLOBAL_CACHED_KEY } from '../constants'
 import sourceCenter from './source_center'
+// 2026.9.12 by Claude Code: 用于在"销毁后迟到的异步回调"里判断是否还能按 appName 清理
+import { isAppNameOwner } from '../libs/app_registry'
 
 export type moduleCallBack = Func & { moduleCount?: number, errorCount?: number }
 
@@ -79,37 +87,18 @@ function code2Function (app: AppInterface, code: string): Function {
 }
 
 /**
- * If the appSpace of the current js address has other app, try to reuse parsedFunction of other app
- * @param appName app.name
- * @param scriptInfo scriptInfo of current address
- * @param currentCode pure code of current address
- */
-function getExistParseResult (
-  app: AppInterface,
-  scriptInfo: ScriptSourceInfo,
-  currentCode: string,
-): Function | void {
-  const appSpace = scriptInfo.appSpace
-  for (const item in appSpace) {
-    if (item !== app.name) {
-      const appSpaceData = appSpace[item]
-      if (appSpaceData.parsedCode === currentCode && appSpaceData.parsedFunction) {
-        return appSpaceData.parsedFunction
-      }
-    }
-  }
-}
-
-/**
- * get parsedFunction from exist data or parsedCode
+ * Create parsedFunction in the current app realm.
+ * Functions must not be shared across application instances. Even when the
+ * transformed source and base Window are identical, the compiled function's
+ * feedback/closure templates participate in that instance's Vue and webpack
+ * runtime graph. Cross-instance reuse can mix component lifecycle state.
  * @returns parsedFunction
  */
 function getParsedFunction (
   app: AppInterface,
-  scriptInfo: ScriptSourceInfo,
   parsedCode: string,
 ): Function {
-  return getExistParseResult(app, scriptInfo, parsedCode) || code2Function(app, parsedCode)
+  return code2Function(app, parsedCode)
 }
 
 // Prevent randomly created strings from repeating
@@ -355,6 +344,13 @@ export function fetchScriptSuccess (
   code: string,
   app: AppInterface,
 ): void {
+  if (app.isDestroyed?.()) {
+    // 2026.9.12 by Claude Code
+    // 这是销毁之后才落地的取脚本回调，捕获的是旧实例。只有 appName 没被同名新实例
+    // 接管时才能按 name 释放，否则会清掉新实例仍在使用的 appSpace。
+    if (isAppNameOwner(app)) sourceCenter.releaseApp(app.name)
+    return
+  }
   // reset scriptInfo.code
   scriptInfo.code = code
 
@@ -364,6 +360,14 @@ export function fetchScriptSuccess (
    * 1. if global parseResult exist, skip this step
    * 2. if app is inline or script is esmodule, skip this step
    * 3. if global parseResult not exist, the current script occupies the position, when js is reused, parseResult is reference
+   *
+   * NOTE(注释已过期) 2026.9.12 by Claude Code
+   * 上面第 1、3 条描述的是“跨 app 共享 parseResult”的旧机制：本轮改动已删除
+   * getExistParseResult，现在只按当前 appSpace 判断，不存在全局 parseResult。
+   * 另外 sourceCenter.releaseApp 在 appSpace 清空后会逐出整条 entry（已确认为有意），
+   * 因此“prefetch 结果被同名真实应用复用”这条路径实际已不成立 ——
+   * micro_app_element 的“先 destroy 再 create”会先把旧实例的 entry 清掉。
+   * 保留原文仅为记录历史语义，不要据此推断当前行为。
    */
   if (app.isPrefetch && app.prefetchLevel === 2) {
     const appSpaceData = scriptInfo.appSpace[app.name]
@@ -379,7 +383,7 @@ export function fetchScriptSuccess (
       appSpaceData.sandboxType = getSandboxType(app, scriptInfo)
       if (!isInlineMode(app, scriptInfo)) {
         try {
-          appSpaceData.parsedFunction = getParsedFunction(app, scriptInfo, appSpaceData.parsedCode)
+          appSpaceData.parsedFunction = getParsedFunction(app, appSpaceData.parsedCode)
         } catch (err) {
           logError('Something went wrong while handling preloaded resources', app.name, '\n', err)
         }
@@ -397,45 +401,106 @@ export function execScripts (
   app: AppInterface,
   initHook: moduleCallBack,
 ): void {
-  const fiberScriptTasks: fiberTasks = app.fiber ? [] : null
-  const scriptList: Array<string> = Array.from(app.source.scripts)
-  const deferScriptPromise: Array<Promise<string>|string> = []
-  const deferScriptInfo: Array<[string, ScriptSourceInfo]> = []
+  executeScriptTask(createScriptTask(app, initHook))
+}
+
+function createScriptTask (app: AppInterface, initHook: moduleCallBack) {
+  return createAppTask(app, {
+    app,
+    initHook,
+    fiberScriptTasks: (app.fiber ? [] : null) as fiberTasks,
+    deferScriptPromise: [] as Array<Promise<string>|string>,
+    deferScriptInfo: [] as Array<[string, ScriptSourceInfo]>,
+  }, (payload) => {
+    // ErrorStackData may retain a local `current` snapshot even after the
+    // holder is cleared. Sever this framework-owned payload itself as well.
+    payload.app = null as unknown as AppInterface
+    payload.initHook = null as unknown as moduleCallBack
+    payload.fiberScriptTasks = null
+    payload.deferScriptPromise = []
+    payload.deferScriptInfo = []
+  })
+}
+
+// No app/initHook parameters in this callback-owning scope. Retained current
+// snapshots point to the explicitly cleared state, not an immutable app slot.
+function executeScriptTask (task: ReturnType<typeof createScriptTask>): void {
+  const scriptList = Array.from(task.current!.app.source.scripts)
+  const invokeInitHook = (isFinished: boolean): void => {
+    const current = task.current
+    if (!current) return
+    try {
+      current.initHook(isFinished)
+    } finally {
+      if (isFinished) task.complete()
+    }
+  }
+  // Module script elements can keep their onload handler indefinitely. Give
+  // them a task-backed callback rather than the CreateApp-capturing initHook.
+  const moduleInitHook = ((isFinished: boolean) => invokeInitHook(isFinished)) as moduleCallBack
+  ;(['moduleCount', 'errorCount'] as const).forEach((key) => {
+    Object.defineProperty(moduleInitHook, key, {
+      configurable: true,
+      get: () => task.current?.initHook?.[key],
+      set: (value: number | undefined) => {
+        const current = task.current
+        if (current) current.initHook[key] = value
+      },
+    })
+  })
   for (const address of scriptList) {
+    const context = task.current
+    if (!context) break
     const scriptInfo = sourceCenter.script.getInfo(address)!
-    const appSpaceData = scriptInfo.appSpace[app.name]
+    const appSpaceData = scriptInfo.appSpace[context.app.name]
     // Notice the second render
     if (appSpaceData.defer || appSpaceData.async) {
       // TODO: defer和module彻底分开，不要混在一起
-      if (scriptInfo.isExternal && !scriptInfo.code && !isTypeModule(app, scriptInfo)) {
-        deferScriptPromise.push(fetchSource(address, app.name))
+      if (scriptInfo.isExternal && !scriptInfo.code && !isTypeModule(context.app, scriptInfo)) {
+        context.deferScriptPromise.push(fetchSource(address, context.app.name))
       } else {
-        deferScriptPromise.push(scriptInfo.code)
+        context.deferScriptPromise.push(scriptInfo.code)
       }
-      deferScriptInfo.push([address, scriptInfo])
+      context.deferScriptInfo.push([address, scriptInfo])
 
-      isTypeModule(app, scriptInfo) && (initHook.moduleCount = initHook.moduleCount ? ++initHook.moduleCount : 1)
+      isTypeModule(context.app, scriptInfo) && (context.initHook.moduleCount = context.initHook.moduleCount ? ++context.initHook.moduleCount : 1)
     } else {
-      injectFiberTask(fiberScriptTasks, () => {
-        runScript(address, app, scriptInfo)
-        initHook(false)
+      injectFiberTask(context.fiberScriptTasks, () => {
+        const current = task.current
+        const currentScriptInfo = sourceCenter.script.getInfo(address)
+        if (!current || !currentScriptInfo) return
+        runScript(address, current.app, currentScriptInfo)
+        invokeInitHook(false)
       })
     }
   }
 
-  if (deferScriptPromise.length) {
-    promiseStream<string>(deferScriptPromise, (res: {data: string, index: number}) => {
-      const scriptInfo = deferScriptInfo[res.index][1]
+  const context = task.current
+  if (!context) return
+  if (context.deferScriptPromise.length) {
+    const deferCount = context.deferScriptPromise.length
+    promiseStream<string>(context.deferScriptPromise, (res: {data: string, index: number}) => {
+      const current = task.current
+      if (!current) return
+      const scriptInfo = current.deferScriptInfo[res.index]?.[1]
+      if (!scriptInfo) return
       scriptInfo.code = scriptInfo.code || res.data
     }, (err: {error: Error, index: number}) => {
-      initHook.errorCount = initHook.errorCount ? ++initHook.errorCount : 1
-      logError(err, app.name)
+      const current = task.current
+      if (!current) return
+      current.initHook.errorCount = current.initHook.errorCount ? ++current.initHook.errorCount : 1
+      logError(err, current.app.name)
     }, () => {
-      deferScriptInfo.forEach(([address, scriptInfo]) => {
+      const current = task.current
+      if (!current) return
+      current.deferScriptInfo.forEach(([address, scriptInfo]) => {
         if (isString(scriptInfo.code)) {
-          injectFiberTask(fiberScriptTasks, () => {
-            runScript(address, app, scriptInfo, initHook)
-            !isTypeModule(app, scriptInfo) && initHook(false)
+          injectFiberTask(current.fiberScriptTasks, () => {
+            const running = task.current
+            const currentScriptInfo = sourceCenter.script.getInfo(address)
+            if (!running || !currentScriptInfo) return
+            runScript(address, running.app, currentScriptInfo, moduleInitHook)
+            !isTypeModule(running.app, currentScriptInfo) && invokeInitHook(false)
           })
         }
       })
@@ -448,25 +513,33 @@ export function execScripts (
        *
        * BUG: NOTE.2 - execution order problem
        */
-      if (fiberScriptTasks) {
-        fiberScriptTasks.push(() => Promise.resolve(initHook(
-          isUndefined(initHook.moduleCount) ||
-          initHook.errorCount === deferScriptPromise.length
-        )))
-        serialExecFiberTasks(fiberScriptTasks)
+      if (current.fiberScriptTasks) {
+        current.fiberScriptTasks.push(() => {
+          const running = task.current
+          if (!running) return Promise.resolve()
+          return Promise.resolve(invokeInitHook(
+            isUndefined(running.initHook.moduleCount) ||
+            running.initHook.errorCount === deferCount
+          ))
+        })
+        serialExecFiberTasks(current.fiberScriptTasks)
       } else {
-        initHook(
-          isUndefined(initHook.moduleCount) ||
-          initHook.errorCount === deferScriptPromise.length
+        invokeInitHook(
+          isUndefined(current.initHook.moduleCount) ||
+          current.initHook.errorCount === deferCount
         )
       }
     })
   } else {
-    if (fiberScriptTasks) {
-      fiberScriptTasks.push(() => Promise.resolve(initHook(true)))
-      serialExecFiberTasks(fiberScriptTasks)
+    if (context.fiberScriptTasks) {
+      context.fiberScriptTasks.push(() => {
+        const running = task.current
+        if (running) invokeInitHook(true)
+        return Promise.resolve()
+      })
+      serialExecFiberTasks(context.fiberScriptTasks)
     } else {
-      initHook(true)
+      invokeInitHook(true)
     }
   }
 }
@@ -485,6 +558,8 @@ export function runScript (
   callback?: moduleCallBack,
   replaceElement?: HTMLScriptElement,
 ): void {
+  if (app.isDestroyed?.()) return
+  const rawPropertySnapshot = app.iframe || !app.useSandbox ? null : beginRawGlobalObjectTracking()
   try {
     actionsBeforeRunScript(app)
     const appSpaceData = scriptInfo.appSpace[app.name]
@@ -506,7 +581,7 @@ export function runScript (
      * 是否是内联模式应该由外部传入，这样自外而内更加统一，逻辑更加清晰
      */
     if (isInlineMode(app, scriptInfo)) {
-      const scriptElement = replaceElement || pureCreateElement('script')
+      const scriptElement = replaceElement || createRunScriptElement(app)
       runCode2InlineScript(
         address,
         appSpaceData.parsedCode,
@@ -531,7 +606,7 @@ export function runScript (
       runParsedFunction(app, scriptInfo)
     }
   } catch (e) {
-    console.warn(`[micro-app from ${replaceElement ? 'runDynamicScript' : 'runScript'}] app ${app.name}: `, e, address)
+    console.warn(`[micro-app from ${replaceElement ? 'runDynamicScript' : 'runScript'}] app ${app.name}: ${String(e)}`, address)
     // throw error in with sandbox to parent app
     const error = e as Error
     let throwError = true
@@ -540,6 +615,13 @@ export function runScript (
     }
     if (throwError) {
       throw e
+    }
+  } finally {
+    if (rawPropertySnapshot) {
+      finishRawGlobalObjectTracking(app, rawPropertySnapshot)
+      releaseSharedFunctionToStringPatch(app)
+      // A child can synchronously destroy itself while executing this script.
+      if (app.isDestroyed?.()) releaseRawGlobalObjectPatches(app)
     }
   }
 }
@@ -562,6 +644,7 @@ export function runDynamicRemoteScript (
   const dispatchScriptOnLoadEvent = () => dispatchOnLoadEvent(originScript)
 
   const runDynamicScript = () => {
+    if (app.isDestroyed?.()) return
     const descriptor = Object.getOwnPropertyDescriptor(globalEnv.rawDocument, 'currentScript')
     if (!descriptor || descriptor.configurable) {
       Object.defineProperty(globalEnv.rawDocument, 'currentScript', {
@@ -663,9 +746,25 @@ function runCode2InlineScript (
 function runParsedFunction (app: AppInterface, scriptInfo: ScriptSourceInfo) {
   const appSpaceData = scriptInfo.appSpace[app.name]
   if (!appSpaceData.parsedFunction) {
-    appSpaceData.parsedFunction = getParsedFunction(app, scriptInfo, appSpaceData.parsedCode!)
+    appSpaceData.parsedFunction = getParsedFunction(app, appSpaceData.parsedCode!)
   }
   appSpaceData.parsedFunction.call(getEffectWindow(app))
+}
+
+/**
+ * Native module scripts inherit their execution realm from the document which
+ * creates them. In iframe mode a base-document script adopted into the iframe
+ * can make absolute ESM imports resolve through the base application's module
+ * map. Always create framework-owned script elements in the iframe realm.
+ *
+ * This is intentionally independent from disableIframeRootDocument: that
+ * option controls child application DOM APIs, not micro-app's script loader.
+ */
+export function createRunScriptElement (app: AppInterface): HTMLScriptElement {
+  if (app.iframe && isFunction(app.sandBox?.createSandboxScriptElement)) {
+    return app.sandBox.createSandboxScriptElement()
+  }
+  return pureCreateElement('script')
 }
 
 /**

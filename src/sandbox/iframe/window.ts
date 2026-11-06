@@ -26,6 +26,10 @@ import {
 } from './special_key'
 import WorkerProxy from '../../proxies/worker'
 import microApp from '../../micro_app'
+import { patchMatchMedia, patchObserverConstructors } from '../observer'
+import createListenerEffect from '../listener_effect'
+import { retainSandboxDom7Cleanup } from '../event_target'
+import { patchAnimationFrame } from '../animation_frame'
 
 /**
  * patch window of child app
@@ -231,9 +235,79 @@ function createProxyWindow (
 }
 
 function patchWindowEffect (microAppWindow: microAppWindowType): CommonEffectHook {
+  const appName = microAppWindow.__MICRO_APP_NAME__
   const { rawWindow, rawAddEventListener, rawRemoveEventListener, rawDispatchEvent } = globalEnv
-  const eventListenerMap = new Map<string, Set<MicroEventListener>>()
-  const sstEventListenerMap = new Map<string, Set<MicroEventListener>>()
+  const intervalIdMap = new Set<number>()
+  const timeoutIdMap = new Set<number>()
+  const webSocketSet = new Set<WebSocket>()
+  const rawSetInterval = microAppWindow.setInterval
+  const rawSetTimeout = microAppWindow.setTimeout
+  const rawClearInterval = microAppWindow.clearInterval
+  const rawClearTimeout = microAppWindow.clearTimeout
+  const RawWebSocket = microAppWindow.WebSocket
+  const releaseObservers = patchObserverConstructors(microAppWindow, microAppWindow)
+  const releaseMediaQueryListeners = patchMatchMedia(microAppWindow, microAppWindow)
+  const animationFrames = patchAnimationFrame(microAppWindow, microAppWindow)
+  const listenerEffect = createListenerEffect(rawAddEventListener, rawRemoveEventListener,
+    (record) => retainSandboxDom7Cleanup(appName, record))
+
+  microAppWindow.setInterval = function (
+    handler: TimerHandler,
+    timeout?: number,
+    ...args: any[]
+  ): number {
+    const intervalId = rawSetInterval.call(microAppWindow, handler, timeout, ...args)
+    intervalIdMap.add(intervalId)
+    return intervalId
+  }
+
+  microAppWindow.setTimeout = function (
+    handler: TimerHandler,
+    timeout?: number,
+    ...args: any[]
+  ): number {
+    const setTimeoutHandler = function (...handlerArgs: any[]): void {
+      timeoutIdMap.delete(timeoutId)
+      typeof handler === 'function' && handler(...handlerArgs)
+    }
+    /**
+     * NOTE(已知小泄漏) 2026.9.12 by Claude Code
+     * 字符串 handler（`setTimeout('code', n)`）无法插入清理逻辑，因此它走的是原始
+     * 字符串分支：触发后 timeoutIdMap 里对应的 id 不会被删除，只能等 release() 时统一
+     * 清理。对高频使用字符串定时器的老库，这个 Map 会呈现“只增不减”的增长。
+     * 若要收敛：该分支不登记 id（代价是 destroy 时无法统一取消），或改用
+     * 触发即清的包装（例如包成 setTimeoutHandler 后再 eval，但会改变 eval 作用域语义）。
+     */
+    const handlerWithCleanup: TimerHandler = typeof handler === 'string' ? handler : setTimeoutHandler
+    const timeoutId = rawSetTimeout.call(microAppWindow, handlerWithCleanup, timeout, ...args)
+    timeoutIdMap.add(timeoutId)
+    return timeoutId
+  }
+
+  microAppWindow.clearInterval = function (intervalId: number): void {
+    intervalIdMap.delete(intervalId)
+    rawClearInterval.call(microAppWindow, intervalId)
+  }
+
+  microAppWindow.clearTimeout = function (timeoutId: number): void {
+    timeoutIdMap.delete(timeoutId)
+    rawClearTimeout.call(microAppWindow, timeoutId)
+  }
+
+  if (isConstructor(RawWebSocket)) {
+    rawDefineProperty(microAppWindow, 'WebSocket', {
+      configurable: true,
+      writable: true,
+      value: new Proxy(RawWebSocket, {
+        construct (Target, args, NewTarget) {
+          const socket = Reflect.construct(Target, args, NewTarget) as WebSocket
+          webSocketSet.add(socket)
+          socket.addEventListener('close', () => webSocketSet.delete(socket), { once: true })
+          return socket
+        },
+      }),
+    })
+  }
 
   function getEventTarget (type: string): Window {
     /**
@@ -254,14 +328,7 @@ function patchWindowEffect (microAppWindow: microAppWindowType): CommonEffectHoo
     listener: MicroEventListener,
     options?: boolean | AddEventListenerOptions,
   ): void {
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList) {
-      listenerList.add(listener)
-    } else {
-      eventListenerMap.set(type, new Set([listener]))
-    }
-    listener && (listener.__MICRO_APP_MARK_OPTIONS__ = options)
-    rawAddEventListener.call(getEventTarget(type), type, listener, options)
+    listenerEffect.add(getEventTarget(type), type, listener, options)
   }
 
   microAppWindow.removeEventListener = function (
@@ -269,11 +336,7 @@ function patchWindowEffect (microAppWindow: microAppWindowType): CommonEffectHoo
     listener: MicroEventListener,
     options?: boolean | AddEventListenerOptions,
   ): void {
-    const listenerList = eventListenerMap.get(type)
-    if (listenerList?.size && listenerList.has(listener)) {
-      listenerList.delete(listener)
-    }
-    rawRemoveEventListener.call(getEventTarget(type), type, listener, options)
+    listenerEffect.remove(getEventTarget(type), type, listener, options)
   }
 
   microAppWindow.dispatchEvent = function (event: Event): boolean {
@@ -281,7 +344,7 @@ function patchWindowEffect (microAppWindow: microAppWindowType): CommonEffectHoo
   }
 
   const reset = (): void => {
-    sstEventListenerMap.clear()
+    listenerEffect.reset()
   }
 
   /**
@@ -294,39 +357,53 @@ function patchWindowEffect (microAppWindow: microAppWindowType): CommonEffectHoo
    *  2. umd-mode(normal): not clear timers, record & rebuild events
    *  3. prerender/keep-alive(default, umd): not clear timers, record & rebuild events
    *
+   * NOTE(差异已修复) 2026.9.12 review
+   * 上面第 2 条对 iframe 沙箱**不成立**：iframe/index.ts 的 stop() 只传 { clearData }，
+   * 且其 releaseGlobalEffect 的开关是 (!keepAlive && !isPrerender) || destroy（不含
+   * umdMode），所以 iframe + umd 应用 unmount 时会清除 timer / 关闭 WebSocket，
+   * 与这里写的“not clear timers”相反。
+   * Review 裁定：不能把无法恢复 timer/socket 当成有意行为。
+   * 现 stop 传递 umdMode/destroy，普通 UMD unmount 保留资源，destroy 强制释放。
+   * （with 沙箱的行为才是与注释一致的：with/index.ts 用
+   *  (!umdMode && !keepAlive && !isPrerender) || destroy。）
+   *
    * TODO: 现在的 清除、记录和恢复操作分散的太零散，sandbox、create_app中都有分散，将代码再优化一下，集中处理
    */
   const record = (): void => {
     // record window event
-    eventListenerMap.forEach((listenerList, type) => {
-      if (listenerList.size) {
-        const cacheList = sstEventListenerMap.get(type) || []
-        sstEventListenerMap.set(type, new Set([...cacheList, ...listenerList]))
-      }
-    })
+    listenerEffect.record()
   }
 
   // rebuild event and timer before remount app
   const rebuild = (): void => {
     // rebuild window event
-    sstEventListenerMap.forEach((listenerList, type) => {
-      for (const listener of listenerList) {
-        microAppWindow.addEventListener(type, listener, listener?.__MICRO_APP_MARK_OPTIONS__)
-      }
+    listenerEffect.rebuild((record) => {
+      microAppWindow.addEventListener(record.type, record.listener, record.options)
     })
-
-    reset()
   }
 
-  const release = (): void => {
+  const release = (clearEffect = true): void => {
+    animationFrames.release(clearEffect)
+    releaseMediaQueryListeners(clearEffect)
+    releaseObservers(clearEffect)
     // Clear window binding events
-    if (eventListenerMap.size) {
-      eventListenerMap.forEach((listenerList, type) => {
-        for (const listener of listenerList) {
-          rawRemoveEventListener.call(getEventTarget(type), type, listener)
+    listenerEffect.release()
+
+    // Keep resources running while a keep-alive app is only hidden, but always
+    // terminate them on a real unmount/destroy so Blink can release the iframe realm.
+    if (clearEffect) {
+      intervalIdMap.forEach((intervalId) => rawClearInterval.call(microAppWindow, intervalId))
+      timeoutIdMap.forEach((timeoutId) => rawClearTimeout.call(microAppWindow, timeoutId))
+      intervalIdMap.clear()
+      timeoutIdMap.clear()
+      webSocketSet.forEach((socket) => {
+        try {
+          socket.close()
+        } catch (_) {
+          // Ignore sockets that have already entered a terminal native state.
         }
       })
-      eventListenerMap.clear()
+      webSocketSet.clear()
     }
   }
 
@@ -335,5 +412,9 @@ function patchWindowEffect (microAppWindow: microAppWindowType): CommonEffectHoo
     record,
     rebuild,
     release,
+    dispose () {
+      animationFrames.dispose()
+      listenerEffect.dispose()
+    },
   }
 }

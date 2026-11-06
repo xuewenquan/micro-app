@@ -1,6 +1,10 @@
 'use strict'
 /* eslint-disable no-console */
 
+// 2026.9.12 review: dts-bundle consumes lib/lib/index.d.ts, which Rollup does
+// not generate in this configuration. package.json must run declaration-only
+// tsc before this script; removing that prerequisite makes yarn build fail.
+
 const path = require('path')
 const dts = require('dts-bundle')
 const chalk = require('chalk')

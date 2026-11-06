@@ -314,11 +314,26 @@ export function formatAppURL(url: string | null, appName: string | null = null):
   if (!isString(url) || !url) return ''
 
   try {
+    // 2026.9.12 review: preserve the existing app-URL contract. A bare relative
+    // string must not silently become a same-origin application and trigger 404
+    // navigation; protocol-relative URLs remain supported by addProtocol.
+    if (!/^(https?:\/\/|file:\/\/|\/\/)/.test(url)) throw new Error(`Invalid app url: ${url}`)
     const { protocol, origin: rawOrigin, host, pathname, search } = createURL(addProtocol(url), (window.rawWindow || window).location.href)
     /**
      * keep the original url unchanged, such as .html .node .php .net .etc, search, except hash
      * BUG FIX: Never using '/' to complete url, refer to https://github.com/jd-opensource/micro-app/issues/1147
      * FEATURE: URL.origin is browser-dependent for file protocol url, refer to https://github.com/jd-opensource/micro-app/pull/1695
+     *
+     * NOTE(已裁定) 2026.9.12 review
+     * 上面这行 createURL 传了 base（location.href），因此**裸相对串**（如 'abc'）会被解析成
+     * 相对当前页面的绝对地址（'http://localhost/abc'），而不是被判为非法。
+     * 这与两处测试的契约冲突：
+     *   - src/__tests__/unit/utils.test.ts: formatAppURL('abc') 期望 ''
+     *   - src/__tests__/micro_app_element.test.ts:90 用 url="abc" 并期望元素层报错，
+     *     而这里返回 '' 正是元素层判断“url 非法”的信号（micro_app_element.ts:155）
+     * 即：两处测试都把“裸相对字符串非法”当作契约，实现却会给出一个看似正常、实际 404 的地址。
+     * 裁定：维持既有测试契约，裸相对字符串非法；上面的显式协议校验已恢复该行为。
+     * 不修改子应用内部路由规则，避免把 app url 校验与业务路由同步混为一谈。
      */
     const origin = protocol === 'file:' ? `${protocol}//${host}` : rawOrigin
     const fullPath = `${origin}${pathname}${search}`

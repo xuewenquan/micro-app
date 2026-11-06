@@ -22,6 +22,8 @@ import {
 } from './load_event'
 import sourceCenter from './source_center'
 import globalEnv from '../libs/global_env'
+// 2026.9.12 by Claude Code: 用于在"销毁后迟到的异步回调"里判断是否还能按 appName 清理
+import { isAppNameOwner } from '../libs/app_registry'
 
 /**
  *
@@ -180,6 +182,13 @@ export function fetchLinkSuccess (
   microAppHead: Element,
   app: AppInterface,
 ): void {
+  if (app.isDestroyed?.()) {
+    // 2026.9.12 by Claude Code
+    // 同 fetchScriptSuccess：销毁后才落地的回调捕获的是旧实例，按 name 释放前必须
+    // 确认 appName 没有被同名新实例接管，否则会清掉新实例的 appSpace。
+    if (isAppNameOwner(app)) sourceCenter.releaseApp(app.name)
+    return
+  }
   /**
    * linkInfo must exist, but linkInfo.code not
    * so we set code to linkInfo.code
@@ -274,6 +283,7 @@ export function formatDynamicLink (
   const convertStyle = pureCreateElement('style')
 
   const handleDynamicLink = () => {
+    if (app.isDestroyed?.()) return
     handleConvertStyle(
       app,
       address,

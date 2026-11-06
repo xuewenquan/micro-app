@@ -33,12 +33,97 @@ import {
 import dispatchLifecyclesEvent, {
   dispatchCustomEventToMicroApp,
 } from './interact/lifecycles_event'
-import globalEnv from './libs/global_env'
+import globalEnv, { clearActiveProxyWindow, releaseRawGlobalObjectPatches } from './libs/global_env'
 import microApp from './micro_app'
 import sourceCenter from './source/source_center'
+import { disposeDataCenterForApp } from './interact'
+import { releaseScopedCSSObservers } from './sandbox/scoped_css_observers'
+import { createAppTask, disposeAppTasks, AppTask } from './libs/app_tasks'
+import { releaseElementInfoTree } from './sandbox/adapter'
+import { releaseWorkersByApp } from './proxies/worker'
+import { appInstanceMap, isAppNameOwner } from './libs/app_registry'
+import { runCleanupStep } from './libs/cleanup'
+import { getDetachedEventTargetElements } from './sandbox/event_target'
 
-// micro app instances
-export const appInstanceMap = new Map<string, AppInterface>()
+// Retain public/internal import compatibility while avoiding loader cycles.
+export { appInstanceMap, isAppNameOwner } from './libs/app_registry'
+
+// Outside mount's lexical scope: a retained readiness reaction must not keep
+// the original container/parameters alive after cancellation or completion.
+function runPendingMount (task: AppTask<{ app: CreateApp | null, options: MountParam | null }>): void {
+  const state = task.current
+  if (!state?.app || !state.options) return
+  try {
+    if (!state.app.isUnmounted() && !state.app.isDestroyed()) state.app.executePendingMount(state.options)
+  } finally {
+    task.complete()
+  }
+}
+
+function createMountReadyCallback (task: AppTask<{ app: CreateApp | null, options: MountParam | null }>): () => void {
+  return () => runPendingMount(task)
+}
+
+function createMountCancelCallback (task: AppTask<{ app: CreateApp | null, options: MountParam | null }>): () => void {
+  return () => task.dispose()
+}
+
+function createBeforeMountCallback (app: CreateApp): () => void {
+  const task = createAppTask(app, { app: app as CreateApp | null }, (state) => { state.app = null })
+  return () => {
+    const current = task.current
+    try {
+      if (current?.app && !current.app.isDestroyed()) {
+        dispatchLifecyclesEvent(current.app.container, current.app.name, lifeCycles.BEFOREMOUNT)
+      }
+    } finally { task.complete() }
+  }
+}
+
+function createScriptMountCallback (app: CreateApp): (finished: boolean) => void {
+  const task = createAppTask(app, { app: app as CreateApp | null }, (state) => { state.app = null })
+  return (finished) => {
+    const current = task.current
+    if (!current?.app || current.app.isDestroyed()) return
+    if (finished) {
+      try { if (!current.app.umdMode) current.app.handleMounted() } finally { task.complete() }
+    }
+  }
+}
+
+function createUmdRegistrationCallback (app: CreateApp): (mount: unknown, unmount: unknown) => void {
+  const task = createAppTask(app, { app: app as CreateApp | null }, (state) => { state.app = null })
+  return (mount, unmount) => task.current?.app?.registerMountHooks(mount, unmount)
+}
+
+// isAppNameOwner 的实现与语义说明见 libs/app_registry.ts。
+// Review correction: this name guard protects a newer instance, but it is not
+// generation ownership. Instance-specific tasks are disposed separately below;
+// remaining name-keyed registries must not be blindly cleared by an old app.
+
+// Deliberately outside CreateApp's method scope: pending Promise reactions must
+// not share the method's lexical context (and its captured `this`).
+function settleUnmountPromise (
+  promise: Promise<unknown>,
+  action: (() => void) | null,
+  reportError: ((e: unknown) => void) | null,
+  terminal: boolean,
+): void {
+  let timer: number | undefined
+  const finish = () => {
+    const next = action
+    action = null
+    reportError = null
+    if (timer !== undefined) globalEnv.rawClearTimeout.call(globalEnv.rawWindow, timer)
+    timer = undefined
+    next?.()
+  }
+  if (terminal) timer = globalEnv.rawSetTimeout.call(globalEnv.rawWindow, finish, 3000)
+  promise.then(finish, (e) => {
+    reportError?.(e)
+    finish()
+  })
+}
 
 // params of CreateApp
 export interface CreateAppParam {
@@ -58,6 +143,8 @@ export interface CreateAppParam {
 
 export default class CreateApp implements AppInterface {
   private state: string = appStates.CREATED
+  private destroyed = false
+  private terminalDOMNodes: Element[] | null = null
   private keepAliveState: string | null = null
   private loadSourceLevel: -1|0|1|2 = 0
   private umdHookMount: Func | null = null
@@ -146,6 +233,13 @@ export default class CreateApp implements AppInterface {
     baseroute,
     disablePatchRequest,
   }: OnLoadParam): void {
+    if (this.destroyed) {
+      // 2026.9.12 by Claude Code
+      // 本实例已销毁，但这次 onLoad 是迟到的：只有当 appName 没有落到同名新实例
+      // 手里时才能按 name 释放源码元数据，否则会清掉新实例的 appSpace。
+      if (isAppNameOwner(this)) sourceCenter.releaseApp(this.name)
+      return
+    }
     if (++this.loadSourceLevel === 2) {
       this.source.html = html
       if (this.isUnmounted()) return
@@ -190,6 +284,7 @@ export default class CreateApp implements AppInterface {
    * @param e Error
    */
   public onLoadError (e: Error): void {
+    if (this.destroyed) return
     this.loadSourceLevel = -1
 
     if (!this.isUnmounted()) {
@@ -240,10 +335,20 @@ export default class CreateApp implements AppInterface {
 
     this.createSandbox()
 
-    const nextAction = () => {
-      // place inside of nextAction, make sure iframe ready
-      this.setAppState(appStates.BEFORE_MOUNT)
-      /**
+    const task = createAppTask(this, {
+      app: this as CreateApp | null,
+      options: {
+        container, inline, routerMode, defaultPage, baseroute, disablePatchRequest, fiber,
+      } as MountParam | null
+    }, (state) => { state.app = null; state.options = null })
+    const ready = createMountReadyCallback(task)
+    this.sandBox ? this.sandBox.sandboxReady.then(ready, createMountCancelCallback(task)) : ready()
+  }
+
+  public executePendingMount ({ container, inline, routerMode, defaultPage, baseroute, disablePatchRequest, fiber }: MountParam): void {
+    // place inside of nextAction, make sure iframe ready
+    this.setAppState(appStates.BEFORE_MOUNT)
+    /**
        * Special scenes:
        * 1. mount before prerender exec mount (loading source)
        * 2. mount when prerender js executing
@@ -252,112 +357,101 @@ export default class CreateApp implements AppInterface {
        *
        * TODO: test shadowDOM
        */
-      if (
-        this.isPrerender &&
+    if (
+      this.isPrerender &&
         isDivElement(this.container) &&
         this.container.hasAttribute('prerender')
-      ) {
-        /**
+    ) {
+      /**
          * current this.container is <div prerender='true'></div>
          * set this.container to <micro-app></micro-app>
          * NOTE:
          *  1. must exec before this.sandBox.rebuildEffectSnapshot
          *  2. must exec before this.preRenderEvents?.forEach((cb) => cb())
          */
-        this.container = this.cloneContainer(container, this.container, false)
-        /**
+      this.container = this.cloneContainer(container, this.container, false)
+      /**
          * rebuild effect event of window, document, data center
          * explain:
          * 1. rebuild before exec mount, do nothing
          * 2. rebuild when js executing, recovery recorded effect event, because prerender fiber mode
          * 3. rebuild after js exec end, normal recovery effect event
          */
-        this.sandBox?.rebuildEffectSnapshot()
-        this.preRenderEvents?.forEach((cb) => cb())
-        // reset isPrerender config
-        this.isPrerender = false
-        this.preRenderEvents = null
-        // attach router info to browser url
-        router.attachToURL(this.name)
-        this.sandBox?.setPreRenderState(false)
+      this.sandBox?.rebuildEffectSnapshot()
+      this.preRenderEvents?.forEach((cb) => cb())
+      // reset isPrerender config
+      this.isPrerender = false
+      this.preRenderEvents = null
+      // attach router info to browser url
+      router.attachToURL(this.name)
+      this.sandBox?.setPreRenderState(false)
+    } else {
+      this.container = container
+      this.inline = this.getInlineModeState(inline)
+      this.fiber = fiber
+      this.routerMode = routerMode
+
+      const dispatchBeforeMount = createBeforeMountCallback(this)
+
+      if (this.isPrerender) {
+        (this.preRenderEvents ??= []).push(dispatchBeforeMount)
       } else {
-        this.container = container
-        this.inline = this.getInlineModeState(inline)
-        this.fiber = fiber
-        this.routerMode = routerMode
+        dispatchBeforeMount()
+      }
 
-        const dispatchBeforeMount = () => {
-          dispatchLifecyclesEvent(
-            this.container,
-            this.name,
-            lifeCycles.BEFOREMOUNT,
-          )
-        }
+      this.setAppState(appStates.MOUNTING)
 
-        if (this.isPrerender) {
-          (this.preRenderEvents ??= []).push(dispatchBeforeMount)
-        } else {
-          dispatchBeforeMount()
-        }
+      // dispatch state event to micro app
+      dispatchCustomEventToMicroApp(this, 'statechange', {
+        appState: appStates.MOUNTING
+      })
 
-        this.setAppState(appStates.MOUNTING)
+      // TODO: 兼容shadowRoot的场景
+      this.cloneContainer(this.container, this.source.html, !this.umdMode)
 
-        // dispatch state event to micro app
-        dispatchCustomEventToMicroApp(this, 'statechange', {
-          appState: appStates.MOUNTING
-        })
+      this.sandBox?.start({
+        umdMode: this.umdMode,
+        baseroute,
+        defaultPage,
+        disablePatchRequest,
+      })
 
-        // TODO: 兼容shadowRoot的场景
-        this.cloneContainer(this.container, this.source.html, !this.umdMode)
+      if (!this.umdMode) {
+        // patch element info of html
+        this.sandBox?.actionsBeforeExecScripts(this.container, createUmdRegistrationCallback(this))
 
-        this.sandBox?.start({
-          umdMode: this.umdMode,
-          baseroute,
-          defaultPage,
-          disablePatchRequest,
-        })
-
-        if (!this.umdMode) {
-          // patch element info of html
-          this.sandBox?.actionsBeforeExecScripts(this.container, (mount, unmount) => {
-            if (!this.umdMode && !this.isUnmounted()) {
-              this.umdHookMount = isFunction(mount) ? mount : null
-              // umdHookUnmount can works in default mode, register by window.unmount
-              this.umdHookUnmount = isFunction(unmount) ? unmount : null
-              // if mount & unmount is function, the sub app is umd mode
-              if (isFunction(this.umdHookMount) && isFunction(this.umdHookUnmount)) {
-                this.sandBox?.markUmdMode(this.umdMode = true)
-                try {
-                  // if appState is mounted, it means that isFinished is true and this.handleMounted has already been executed, just exec this.umdHookMount
-                  if (this.getAppState() === appStates.MOUNTED) {
-                    this.umdHookMount(microApp.getData(this.name, true))
-                  } else {
-                    this.handleMounted(this.umdHookMount(microApp.getData(this.name, true)))
-                  }
-                } catch (e) {
-                  logError('An error occurred when mount \n', this.name, e)
-                }
-              }
-            }
-          })
-
-          // if all js are executed, param isFinished will be true
-          execScripts(this, (isFinished: boolean) => {
-            if (!this.umdMode && isFinished === true) {
-              this.handleMounted()
-            }
-          })
-        } else {
-          this.sandBox?.rebuildEffectSnapshot()
-          try {
-            this.handleMounted(this.umdHookMount!(microApp.getData(this.name, true)))
-          } catch (e) {
-            logError('An error occurred when mount \n', this.name, e)
-          }
+        execScripts(this, createScriptMountCallback(this))
+      } else {
+        this.sandBox?.rebuildEffectSnapshot()
+        try {
+          this.handleMounted(this.umdHookMount!(microApp.getData(this.name, true)))
+        } catch (e) {
+          logError('An error occurred when mount \n', this.name, e)
         }
       }
     }
+  }
 
+  public registerMountHooks (mount: unknown, unmount: unknown): void {
+    if (!this.destroyed && !this.umdMode && !this.isUnmounted()) {
+      this.umdHookMount = isFunction(mount) ? mount as Func : null
+      // umdHookUnmount can works in default mode, register by window.unmount
+      this.umdHookUnmount = isFunction(unmount) ? unmount as Func : null
+      // if mount & unmount is function, the sub app is umd mode
+      if (isFunction(this.umdHookMount) && isFunction(this.umdHookUnmount)) {
+        this.sandBox?.markUmdMode(this.umdMode = true)
+        try {
+          // if appState is mounted, it means that isFinished is true and this.handleMounted has already been executed, just exec this.umdHookMount
+          if (this.getAppState() === appStates.MOUNTED) {
+            this.umdHookMount(microApp.getData(this.name, true))
+          } else {
+            this.handleMounted(this.umdHookMount(microApp.getData(this.name, true)))
+          }
+        } catch (e) {
+          logError('An error occurred when mount \n', this.name, e)
+        }
+      }
+    }
     /**
      * Initialization of sandbox is async, especially iframe sandbox are macro tasks
      * when child apps switch quickly, we need to pay attention to the following points:
@@ -368,14 +462,13 @@ export default class CreateApp implements AppInterface {
      *  3. unmount app during exec js
      */
     // TODO: 可优化？
-    this.sandBox ? this.sandBox.sandboxReady.then(() => !this.isUnmounted() && nextAction()) : nextAction()
   }
 
   /**
    * handle for promise umdHookMount
    * @param umdHookMountResult result of umdHookMount
    */
-  private handleMounted (umdHookMountResult?: unknown): void {
+  public handleMounted (umdHookMountResult?: unknown): void {
     const dispatchAction = () => {
       const nextAction = () => this.actionsAfterMounted()
       if (isPromise(umdHookMountResult)) {
@@ -463,19 +556,26 @@ export default class CreateApp implements AppInterface {
   }: UnmountParam): void {
     destroy = destroy || this.state === appStates.LOAD_FAILED
 
+    // Review correction: Vue/transition hooks may detach nodes before the final
+    // container traversal. Retain only this instance's current owned nodes,
+    // and only for terminal unmount; never snapshot a keep-alive switch.
+    if (destroy && !this.destroyed && !this.terminalDOMNodes) this.captureTerminalDOM()
     this.setAppState(appStates.UNMOUNT)
 
+    let umdHookUnmountResult: unknown
     try {
-      this.handleUnmounted(
-        destroy,
-        clearData,
-        keepRouteState,
-        unmountcb,
-        this.umdHookUnmount?.(microApp.getData(this.name, true)),
-      )
+      umdHookUnmountResult = this.umdHookUnmount?.(microApp.getData(this.name, true))
     } catch (e) {
       logError('An error occurred when unmount \n', this.name, e)
     }
+
+    this.handleUnmounted(
+      destroy,
+      clearData,
+      keepRouteState,
+      unmountcb,
+      umdHookUnmountResult,
+    )
   }
 
   /**
@@ -518,15 +618,16 @@ export default class CreateApp implements AppInterface {
     if (isPromise(umdHookUnmountResult)) {
       // async window.unmount will cause appName bind error in nest app
       removeDomScope()
-      umdHookUnmountResult
-        .then(nextAction)
-        .catch((e) => {
-          logError('An error occurred in window.unmount \n', this.name, e)
-          nextAction()
-        })
-    } else {
-      nextAction()
-    }
+      // Terminal destroy must not wait forever for an application-owned Promise.
+      // Promise reactions capture only this mutable holder; after cleanup even a
+      // permanently pending Promise no longer retains CreateApp/container/source.
+      settleUnmountPromise(
+        umdHookUnmountResult,
+        nextAction,
+        (e) => logError(`An error occurred in window.unmount: ${String(e)}`, this.name),
+        destroy,
+      )
+    } else nextAction()
   }
 
   /**
@@ -543,7 +644,7 @@ export default class CreateApp implements AppInterface {
     unmountcb,
   }: UnmountParam): void {
     if (this.umdMode && this.container && !destroy) {
-      this.cloneContainer(this.source.html, this.container as HTMLElement, false)
+      runCleanupStep(this.name, 'clone UMD container', () => this.cloneContainer(this.source.html, this.container as HTMLElement, false))
     }
     const shouldClearData = this.isReloading ? false : (clearData || destroy)
     /**
@@ -552,23 +653,123 @@ export default class CreateApp implements AppInterface {
      * 1. if destroy is true, clear route state
      * 2. umd mode and keep-alive will not clear EventSource
      */
-    this.sandBox?.stop({
+    runCleanupStep(this.name, 'stop sandbox after unmount', () => this.sandBox?.stop({
       umdMode: this.umdMode,
       keepRouteState: keepRouteState && !destroy,
       destroy,
       clearData: shouldClearData,
-    })
+    }))
 
     // dispatch unmount event to base app
-    dispatchLifecyclesEvent(
+    runCleanupStep(this.name, 'dispatch base unmount lifecycle', () => dispatchLifecyclesEvent(
       this.container,
       this.name,
       lifeCycles.UNMOUNT,
-    )
+    ))
 
-    this.clearOptions(destroy)
+    runCleanupStep(this.name, 'clear unmount options', () => this.clearOptions(destroy))
+    // Even a DOM/prototype failure in clearOptions cannot skip terminal cleanup.
+    if (destroy) this.actionsForCompletelyDestroy()
 
-    unmountcb?.()
+    runCleanupStep(this.name, 'complete unmount callback', () => { unmountcb?.() })
+  }
+
+  /**
+   * 2026.9.12 by Claude Code
+   * 终态销毁前的深度 DOM 清理。
+   *
+   * 背景：`container.innerHTML = ''` 只是把 <micro-app-head>/<micro-app-body> 从容器上
+   * 摘下来，并不会清空它们自己的子树。而子应用的 UI 库常以 `document.head` 作为样式缓存的
+   * key —— 在 with 沙箱里 `document.head` 解析到的正是 micro-app 造的 <micro-app-head>。
+   * 一旦这个 head 被子应用侧的模块级 Map 长期持有，它的整棵子树以及 <style> 的
+   * CSSStyleSheet（Blink 解析后的 StyleRule / CSSSelector::RareData /
+   * CSSPropertyValueSet）就会一起活着。13:42 快照实测：单个 style 元素即可独占
+   * 2.03 MB、31,330 个原生节点。
+   *
+   * 所以在摘除容器之前，先清空这些元素的子树与 style 内容：即使外部仍持有 head/body，
+   * 解析后的 CSS 也能立刻释放。这是**缓解**——它不解决“子应用库拿基座共享元素做 key”的根因，
+   * 但能保证框架自己拥有的 DOM 子树不再被拖住。
+   *
+   * 约束（务必保持）：
+   *  1. 只在终态 destroy 路径调用，**不能**用于 keep-alive / umd 的切换与保活；
+   *  2. 只处理本实例容器内的 micro-app-head / micro-app-body，
+   *     **绝不触碰基座真实的 document.head / document.body**；
+   *  3. 幂等：重复调用只是空查询。
+   */
+  private captureTerminalDOM (): void {
+    const nodes: Element[] = []
+    const visit = (node: Element): void => {
+      const tag = node.tagName.toLowerCase()
+      if (tag.startsWith('micro-app') && tag !== 'micro-app-head' && tag !== 'micro-app-body') return
+      nodes.push(node)
+      Array.from(node.children).forEach(visit)
+    }
+    Array.from(this.container?.children || []).forEach(visit)
+    // Also cover already-detached, explicitly marked listener targets. Name-
+    // keyed effect logs must not be read by a stale same-name instance.
+    if (isAppNameOwner(this)) {
+      getDetachedEventTargetElements(this.name).forEach((node) => {
+        if (!nodes.includes(node)) nodes.push(node)
+      })
+    }
+    this.terminalDOMNodes = nodes
+  }
+
+  private clearInstanceDOM (): void {
+    // Drop the holder first, including when container was cleared by the hook.
+    // A retained unmount Promise must not retain this temporary node snapshot.
+    const detachedCandidates = this.terminalDOMNodes
+    this.terminalDOMNodes = null
+    const container = this.container
+    detachedCandidates?.forEach((node) => {
+      // Reparented live nodes may now belong to another application. Detached
+      // nodes from the pre-hook snapshot remain ours; do not scan document.
+      if (node.isConnected && (!container || !container.contains(node))) return
+      runCleanupStep(this.name, 'cancel pre-unmount owned animations', () => {
+        node.getAnimations?.().forEach((animation) => {
+          runCleanupStep(this.name, 'cancel detached owned animation', () => animation.cancel())
+        })
+      })
+    })
+    if (!container) return
+    // 1) 先清 style 内容：部分 UI 库单独缓存 style 元素，只清子树覆盖不到它
+    // Review: traverse only owned DOM. A nested application's internals must be
+    // cleaned by its own unmount chain, not by this parent's style traversal.
+    const visit = (node: Element): void => {
+      const tag = node.tagName.toLowerCase()
+      if (tag.startsWith('micro-app') && tag !== 'micro-app-head' && tag !== 'micro-app-body') {
+        const child = appInstanceMap.get(node.getAttribute('name') || '')
+        // Identity, not name alone: do not destroy a replacement/other Tab.
+        if (child && child !== this && child.container && getRootContainer(child.container) === node && !child.isDestroyed?.()) {
+          runCleanupStep(this.name, 'unmount owned nested app', () => child.unmount({ destroy: true, clearData: true, keepRouteState: false }))
+        }
+        return
+      }
+      // Review correction (2026-09-14): DocumentTimeline can retain detached
+      // animation targets and their Vue event invokers after the DOM is emptied.
+      // Cancel only this node's animations, never document.getAnimations() or
+      // subtree:true: nested applications own their separate teardown sequence.
+      runCleanupStep(this.name, 'cancel owned DOM animations', () => {
+        if (typeof node.getAnimations !== 'function') return
+        node.getAnimations().forEach((animation) => {
+          runCleanupStep(this.name, 'cancel owned animation', () => animation.cancel())
+        })
+      })
+      Array.from(node.children).forEach(visit)
+      if (tag === 'style') {
+        // CSSOM insertRule need not create Text nodes. Empty the owned sheet
+        // before detaching it; inaccessible sheets must not abort teardown.
+        runCleanupStep(this.name, 'clear owned CSSOM rules', () => {
+          const sheet = (node as HTMLStyleElement).sheet
+          if (sheet) while (sheet.cssRules.length) sheet.deleteRule(sheet.cssRules.length - 1)
+        })
+        node.textContent = ''
+      }
+      if (tag === 'micro-app-head' || tag === 'micro-app-body') node.innerHTML = ''
+    }
+    Array.from(container.children).forEach(visit)
+    // Also cover direct terminal destruction and non-head/body wrapper nodes.
+    container.innerHTML = ''
   }
 
   private clearOptions (destroy: boolean): void {
@@ -576,6 +777,8 @@ export default class CreateApp implements AppInterface {
     this.preRenderEvents = null
     this.setKeepAliveState(null)
     if (this.container) {
+      // 2026.9.12 by Claude Code: 仅终态销毁做深度清理；普通卸载/保活切换保持原行为
+      if (destroy) runCleanupStep(this.name, 'clear instance dom', () => this.clearInstanceDOM())
       this.container.innerHTML = ''
       this.container = null
     } else if (!this.umdMode) {
@@ -591,16 +794,81 @@ export default class CreateApp implements AppInterface {
      *  1. with沙箱与iframe沙箱保持一致：with沙箱默认模式下删除 或者 iframe沙箱umd模式下保留
      *  2. 接1.0，this.sandBox置空，还需要注意后续app.sandBox相关操作，比如 scripts.ts --> app.iframe ? app.sandBox!.microBody : app.querySelector('micro-app-body')，如果是fiber或者预加载，会存在卸载后js还在处理的情况
      */
-    if (this.iframe && !this.umdMode) this.sandBox = null
+    if (this.iframe && !this.umdMode && !destroy) {
+      // Default iframe remount requires a fresh realm. Do not discard the only
+      // sandbox handle before disposing its patches/native effects; also drop
+      // Functions compiled in that realm while preserving reloadable metadata.
+      if (isAppNameOwner(this)) {
+        runCleanupStep(this.name, 'release discarded iframe functions', () => sourceCenter.releaseAppRealm(this.name))
+      }
+      runCleanupStep(this.name, 'dispose discarded iframe tasks', () => disposeAppTasks(this))
+      // Dispose only the old realm; ordinary unmount still preserves app data.
+      runCleanupStep(this.name, 'dispose discarded iframe', () => (this.sandBox as IframeSandbox | null)?.destroy(false))
+      this.sandBox = null
+    }
     if (destroy) this.actionsForCompletelyDestroy()
     removeDomScope()
   }
 
   // actions for completely destroy
   public actionsForCompletelyDestroy (): void {
-    this.sandBox?.deleteIframeElement?.()
-    sourceCenter.script.deleteInlineInfo(this.source.scripts)
-    appInstanceMap.delete(this.name)
+    if (this.destroyed) return
+    this.destroyed = true
+
+    const sandBox = this.sandBox
+    // Tasks belong to an app instance, not a reusable name. Always release old
+    // instance tasks even when a same-name replacement is already registered.
+    runCleanupStep(this.name, 'dispose instance tasks', () => disposeAppTasks(this))
+
+    // 2026.9.12 by Claude Code
+    // 下面这些清理全部按 appName 作用于**全局注册表**（源码中心、异步任务表、
+    // scopedCSS observer、数据中心、iframe 节点表、Worker 表）。如果本次销毁的是
+    // 已被同名新实例替换掉的旧实例，按 name 清理会连带抹掉新实例的状态，所以统一用
+    // isAppNameOwner 守卫：只在"本实例仍拥有该名字"时清理，否则交给新实例销毁时处理。
+    // 注意 sandbox 自身的清理不在此列 —— 它是实例级的，无论名字归谁都必须执行。
+    if (isAppNameOwner(this)) {
+      // Remove global owners first; appSpace may contain Functions from iframe realms.
+      runCleanupStep(this.name, 'dispose named tasks', () => disposeAppTasks(this.name))
+      runCleanupStep(this.name, 'release scoped CSS', () => releaseScopedCSSObservers(this.name))
+      runCleanupStep(this.name, 'release source metadata', () => sourceCenter.releaseApp(this.name))
+      runCleanupStep(this.name, 'dispose data center', () => disposeDataCenterForApp(this.name))
+
+      // iframe 沙箱在默认模式 unmount 后就会被置空（见 clearOptions），所以两步销毁
+      // （先 unmount 再 destroy）走到这里时 sandBox 已经是 null，下面的
+      // sandBox?.destroy?.() 会空转 —— 而 releaseElementInfoTree 与 releaseWorkersByApp
+      // 只挂在 IframeSandbox.destroy 里，于是都不会执行：
+      //  1. adapter.ts 的 iframeAppNodeMap 是模块级 Map，会永久持有该应用整棵游离 DOM；
+      //  2. workerInstanceMap 里的 Worker 永不 terminate。
+      // 这里补一层不依赖 sandbox 实例的兜底。两个函数都是幂等的，且
+      // releaseElementInfoTree 在 trackedNodes 缺失且 container 为 null 时是空操作。
+      if (this.iframe) {
+        runCleanupStep(this.name, 'release iframe nodes', () => releaseElementInfoTree(null, this.name))
+        runCleanupStep(this.name, 'release iframe workers', () => releaseWorkersByApp(this.name))
+      }
+    }
+
+    runCleanupStep(this.name, 'clear execution pointer', () => clearActiveProxyWindow(sandBox?.proxyWindow))
+    runCleanupStep(this.name, 'destroy sandbox', () => sandBox?.destroy?.())
+    runCleanupStep(this.name, 'restore owned intrinsic patches', () => releaseRawGlobalObjectPatches(this))
+
+    this.umdHookMount = null
+    this.umdHookUnmount = null
+    this.preRenderEvents = null
+    this.source.html = null
+    this.source.links.clear()
+    this.source.scripts.clear()
+    // 2026.9.12 by Claude Code
+    // 直达终态销毁的路径（如 micro_app.ts 中 isUnmounted()/isPrefetch 且 destroy 的分支）
+    // 不会经过 clearOptions，此时 container 可能仍然存在 —— 补一次深度清理。
+    // 走正常 unmount→destroy 路径时 clearOptions 已清过，这里是幂等的空查询。
+    runCleanupStep(this.name, 'clear instance dom', () => this.clearInstanceDOM())
+    this.container = null
+    this.sandBox = null
+
+    // Do not delete a newer instance that reused the same app name.
+    if (appInstanceMap.get(this.name) === this) {
+      appInstanceMap.delete(this.name)
+    }
   }
 
   // hidden app when disconnectedCallback called with keep-alive
@@ -797,6 +1065,10 @@ export default class CreateApp implements AppInterface {
   // is app unmounted
   public isUnmounted (): boolean {
     return appStates.UNMOUNT === this.state
+  }
+
+  public isDestroyed (): boolean {
+    return this.destroyed
   }
 
   // is app already hidden

@@ -19,6 +19,7 @@ import {
   getIframeParentNodeDesc,
 } from '../adapter'
 import microApp from '../../micro_app'
+import { appInstanceMap } from '../../create_app'
 
 /**
  * patch Element & Node of child app
@@ -31,9 +32,8 @@ export function patchElement (
   appName: string,
   url: string,
   microAppWindow: microAppWindowType,
-  sandbox: IframeSandbox,
 ): void {
-  patchIframeNode(appName, microAppWindow, sandbox)
+  patchIframeNode(appName, microAppWindow)
   patchIframeAttribute(url, microAppWindow, appName)
 }
 
@@ -44,7 +44,6 @@ export function patchElement (
 function patchIframeNode (
   appName: string,
   microAppWindow: microAppWindowType,
-  sandbox: IframeSandbox,
 ): void {
   const rawRootElement = globalEnv.rawRootElement // native root Element
   const rawRootNode = globalEnv.rawRootNode
@@ -73,9 +72,10 @@ function patchIframeNode (
   }
 
   const getRawTarget = (parent: Node): Node => {
-    if (parent === sandbox.microHead) {
+    const sandbox = appInstanceMap.get(appName)?.sandBox as IframeSandbox | undefined
+    if (parent === sandbox?.microHead) {
       return rawDocument.head
-    } else if (parent === sandbox.microBody) {
+    } else if (parent === sandbox?.microBody) {
       return rawDocument.body
     }
 
@@ -163,7 +163,7 @@ function patchIframeNode (
     configurable: true,
     enumerable: true,
     get () {
-      return sandbox.proxyWindow.location.href
+      return appInstanceMap.get(appName)?.sandBox?.proxyWindow?.location.href || rawDocument.baseURI
     },
   })
 

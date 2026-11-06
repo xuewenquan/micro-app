@@ -260,8 +260,9 @@ describe('sandbox', () => {
     expect(proxyWindow.key1).toBe('new-value1')
     // Object.defineProperty定义不会触发proxy set钩子
     expect(window.key1).toBeUndefined()
-    expect(window.key2).toBe('new-value2')
-    // 兜底到原window上
+    // Existing raw-window properties must not be overwritten by child polyfills.
+    expect(window.key2).toBe('value2')
+    // The proxy resolves the child-owned override first.
     expect(proxyWindow.key2).toBe('new-value2')
     expect(proxyWindow['not-exist']).toBe('not-exist-value')
   })

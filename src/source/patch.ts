@@ -51,6 +51,10 @@ import {
 } from '../sandbox/adapter'
 import microApp from '../micro_app'
 import globalEnv from '../libs/global_env'
+import {
+  patchEventTarget,
+  releasePatchEventTarget,
+} from '../sandbox/event_target'
 
 // Record element and map element
 const dynamicElementInMicroAppMap = new WeakMap<Node, Element | Comment>()
@@ -179,14 +183,18 @@ function invokePrototypeMethod(
     ) {
       const descriptor = Object.getOwnPropertyDescriptor(targetNode, 'parentNode')
       if ((!descriptor || descriptor.configurable) && !targetNode.__MICRO_APP_HAS_DPN__) {
+        // Do not capture the CreateApp instance in a descriptor installed on a
+        // DOM node. Detached nodes can outlive the app and would otherwise keep
+        // the complete app/runtime graph alive after terminal destroy.
+        const appName = app.name
         rawDefineProperties(targetNode, {
           parentNode: {
             configurable: true,
             get() {
               const result: ParentNode = globalEnv.rawParentNodeDesc.get.call(this)
-              if (isMicroAppBody(result) && app.container) {
+              if (isMicroAppBody(result) && appInstanceMap.get(appName)?.container) {
                 // TODO: remove getRootElementParentNode
-                return microApp.options.getRootElementParentNode?.(this, app.name) || document.body
+                return microApp.options.getRootElementParentNode?.(this, appName) || document.body
               }
               return result
             },
@@ -377,6 +385,7 @@ function commonElementHandler(
  */
 export function patchElementAndDocument(): void {
   patchDocument()
+  patchEventTarget()
 
   const rawRootElement = globalEnv.rawRootElement
   const rawRootNode = globalEnv.rawRootNode
@@ -846,6 +855,7 @@ function releasePatchDocument(): void {
 export function releasePatchElementAndDocument(): void {
   removeDomScope()
   releasePatchDocument()
+  releasePatchEventTarget()
 
   const rawRootElement = globalEnv.rawRootElement
   const rawRootNode = globalEnv.rawRootNode

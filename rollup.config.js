@@ -63,7 +63,7 @@ const esConfig = Object.assign({}, getBaseConfig(true), {
     {
       file: path.join(__dirname, 'lib/index.esm.js'),
       format: 'es',
-      sourcemap: true
+      sourcemap: false
     }
   ],
 })
@@ -74,13 +74,13 @@ const cjsConfig = Object.assign({}, baseConfigForNormal, {
     {
       file: path.join(__dirname, 'lib/index.min.js'),
       format: 'cjs',
-      sourcemap: true,
+      sourcemap: false,
       exports: 'named'
     },
     {
       file: path.join(__dirname, 'lib/index.umd.js'),
       format: 'umd',
-      sourcemap: true,
+      sourcemap: false,
       exports: 'named',
       name: 'microApp',
     }
@@ -103,7 +103,7 @@ polyfillFiles && polyfillFiles.forEach((file) => {
       output: {
         file: path.join(__dirname, `polyfill/${file.replace(/\.ts$/, '.js')}`),
         format: 'es',
-        sourcemap: true,
+        sourcemap: false,
       },
       plugins: getCommonPlugins().concat([
         typescript(),

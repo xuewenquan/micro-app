@@ -3,19 +3,16 @@ import { isFunction } from '../libs/utils'
 function eventHandler (event: Event, element: HTMLLinkElement | HTMLScriptElement): void {
   Object.defineProperties(event, {
     currentTarget: {
-      get () {
-        return element
-      }
+      configurable: true,
+      value: element,
     },
     srcElement: {
-      get () {
-        return element
-      }
+      configurable: true,
+      value: element,
     },
     target: {
-      get () {
-        return element
-      }
+      configurable: true,
+      value: element,
     },
   })
 }

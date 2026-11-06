@@ -58,7 +58,10 @@ export default class EventCenter {
     this.recordStep = {}
     this.queue = []
     while (name = queue.shift()) {
-      const eventInfo = this.eventList.get(name)!
+      const eventInfo = this.eventList.get(name)
+      const step = temRecordStep[name]
+      // The event may have been permanently disposed before this microtask runs.
+      if (!eventInfo || !step) continue
       // clear tempData, force before exec nextStep
       const tempData = eventInfo.tempData
       const force = eventInfo.force
@@ -72,13 +75,13 @@ export default class EventCenter {
           res && (resArr ??= []).push(res)
         }
 
-        temRecordStep[name]!.dispatchDataEvent?.()
+        step.dispatchDataEvent?.()
 
         /**
          * WARING:
          * If data of other app is sent in nextStep, it may cause confusion of tempData and force
          */
-        temRecordStep[name]!.nextStepList.forEach((nextStep) => nextStep(resArr))
+        step.nextStepList.forEach((nextStep) => nextStep(resArr))
       }
     }
   }
@@ -162,6 +165,25 @@ export default class EventCenter {
       if (eventInfo) {
         eventInfo.data = {}
       }
+    }
+  }
+
+  /**
+   * Permanently remove an event channel and every pending reference owned by it.
+   * Unlike clearData, this method is only intended for app destruction.
+   */
+  public dispose (name: string): void {
+    if (this.isLegalName(name)) {
+      const eventInfo = this.eventList.get(name)
+      if (eventInfo) {
+        eventInfo.callbacks.clear()
+        eventInfo.data = {}
+        eventInfo.tempData = null
+        eventInfo.force = false
+      }
+      this.eventList.delete(name)
+      delete this.recordStep[name]
+      this.queue = this.queue.filter((eventName) => eventName !== name)
     }
   }
 
