@@ -31,7 +31,6 @@ describe('iframe terminal destroy safety', () => {
   })
 
   /**
-   * 2026.9.12 by Claude Code
    * patchIframe 是异步的，windowEffect / documentEffect 只在 iframe 提交后的回调里
    * 赋值。修复前 destroy() 里写的是 `this.windowEffect.dispose?.()` —— `?.` 只保护了
    * dispose，没保护 windowEffect 本身，因此在 iframe 提交前销毁会抛 TypeError。
@@ -65,7 +64,6 @@ describe('iframe terminal destroy safety', () => {
   })
 
   /**
-   * 2026.9.12 by Claude Code
    * WithSandBox.destroy 对 keep-alive / umd 应用补了这段兜底，iframe 之前漏了：
    * 应用先 stop({ umdMode: true, destroy: false }) 再终态销毁时走非活跃分支，
    * 而 stop() 内的 releaseWorkersByApp 被 `!umdMode || destroy` 挡住。
@@ -88,7 +86,6 @@ describe('iframe terminal destroy safety', () => {
   })
 
   /**
-   * 2026.9.12 by Claude Code
    * iframe 沙箱在默认模式 unmount 后会被 clearOptions 置空，两步销毁
    * （先 unmount 再 destroy）时 sandBox 已是 null，sandBox?.destroy?.() 空转 ——
    * releaseElementInfoTree 与 releaseWorkersByApp 都只挂在 IframeSandbox.destroy 里，

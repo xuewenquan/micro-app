@@ -11,7 +11,6 @@ jest.mock('../../proxies/worker', () => ({
 }))
 
 /**
- * 2026.9.12 by Claude Code
  * 构造一个「容器 + micro-app-head(含 style) + micro-app-body(含子节点)」的结构，
  * 模拟子应用挂载后的 DOM 形态。
  */

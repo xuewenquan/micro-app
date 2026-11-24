@@ -79,7 +79,7 @@ function createSourceCenter (): SourceCenter {
      * being garbage-collected. Scanning the source maps also covers dynamic remote
      * assets, which are not recorded in app.source.
      *
-     * NOTE(已知取舍) 2026.9.12 by Claude Code
+     * NOTE(已知取舍)
      * 本函数在 appSpace 清空后会把整条 entry 逐出（sourceList.delete(address)），
      * 这一点经复核**确认保持现状**（内存优先：destroy 后连源码文本一起释放）。
      *

@@ -388,7 +388,6 @@ export default class IframeSandbox {
     if (this.destroyed) return
     this.destroyed = true
 
-    // 2026.9.12 by Claude Code
     // patchIframe 是异步的：windowEffect / documentEffect / restoreIframePatches
     // 只在 iframe 提交后的回调里赋值。若在提交前销毁（同 tick 挂载又卸载、
     // LOAD_FAILED、对未完成 mount 的应用执行 destroy），它们仍是 undefined，
@@ -424,7 +423,6 @@ export default class IframeSandbox {
       cleanup('restore iframe patches', () => this.restoreIframePatches?.())
       cleanup('reset effect snapshots', () => this.resetEffectSnapshot())
 
-      // 2026.9.12 by Claude Code
       // WithSandBox.destroy 对 keep-alive / umd 应用补了同样的兜底，iframe 之前漏了：
       // 应用若先 stop({ umdMode: true, destroy: false }) 再终态销毁，走的是非活跃
       // 分支，而 stop() 内的 releaseWorkersByApp 被 `!umdMode || destroy` 挡住，
@@ -445,7 +443,6 @@ export default class IframeSandbox {
         ].forEach((key) => cleanup(`clear ${key}`, () => { Reflect.deleteProperty(this.microAppWindow, key) }))
       }
 
-      // 2026.9.12 by Claude Code
       // 两个 dispose 放在本段最后：它们还原被补丁的原型，是最可能
       // 与"半初始化 realm"交互失败的一步；放最后可保证即使它们失败，前面的清理
       // （节点表释放、Worker 释放、framework 全局清理）都已经完成。

@@ -271,7 +271,7 @@ function patchWindowEffect (microAppWindow: microAppWindowType): CommonEffectHoo
       typeof handler === 'function' && handler(...handlerArgs)
     }
     /**
-     * NOTE(已知小泄漏) 2026.9.12 by Claude Code
+     * NOTE(已知小泄漏)
      * 字符串 handler（`setTimeout('code', n)`）无法插入清理逻辑，因此它走的是原始
      * 字符串分支：触发后 timeoutIdMap 里对应的 id 不会被删除，只能等 release() 时统一
      * 清理。对高频使用字符串定时器的老库，这个 Map 会呈现“只增不减”的增长。

@@ -23,7 +23,7 @@ interface AppEventTargetEffect {
 
 const appEventTargetEffects = new Map<string, AppEventTargetEffect>()
 /**
- * NOTE(已知风险) 2026.9.12 by Claude Code
+ * NOTE(已知风险)
  * 这个 Set 只增不减：只有 activateEventTargetEffect(appName) 会移除条目，而它只在
  * sandbox.start() 时按同名调用。对于「每次实例都取唯一名字」的用法（如基座为每个
  * 组件实例生成 WS-Component-XXX-<时间戳> 作为 appName），名字不会重复出现，
@@ -136,7 +136,7 @@ function recordListener(
   if (!listener) return true
   const appName = getAppName(target)
   /**
-   * TODO(待决定) 2026.9.12 by Claude Code
+   * TODO(待决定)
    *
    * 归属不到 app 的监听器在这里被**放行但完全不记账**，releaseEventTargetListeners
    * 永远删不到它，但“未归属”并不等于“子应用泄漏”。

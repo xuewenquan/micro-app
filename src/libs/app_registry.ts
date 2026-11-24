@@ -5,7 +5,6 @@ import type { AppInterface } from '@micro-app/types'
 export const appInstanceMap = new Map<string, AppInterface>()
 
 /**
- * 2026.9.12 by Claude Code
  * 判断某个 app 实例是否仍然“拥有”它的应用名。
  *
  * 背景：销毁之后的迟到异步回调（onLoad / fetchScriptSuccess / fetchLinkSuccess 等）

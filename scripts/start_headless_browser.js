@@ -187,7 +187,7 @@ async function main () {
           '"OpenProcess: 拒绝访问 (0x5)"），随即自终止。\n' +
           '      这是**受限沙箱环境**造成的，和启动参数无关。\n' +
           '      请在"自己的"终端里启动：在资源管理器里**双击** scripts\\start-headless-browser.cmd，\n' +
-          '      或从开始菜单新开一个 PowerShell 窗口再执行本命令（不要用 DSH / Codex 的沙箱终端）。'
+          '      或从开始菜单新开一个 PowerShell 窗口再执行本命令（避免使用受沙箱限制的终端）。'
       } else if (!tail.trim()) {
         hint = '\n浏览器 stderr 是空的：说明进程还没来得及报错就被结束了，' +
           '典型原因是它运行在受限沙箱里（沙箱会在父进程退出时一并结束子进程）。\n' +

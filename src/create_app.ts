@@ -234,7 +234,6 @@ export default class CreateApp implements AppInterface {
     disablePatchRequest,
   }: OnLoadParam): void {
     if (this.destroyed) {
-      // 2026.9.12 by Claude Code
       // 本实例已销毁，但这次 onLoad 是迟到的：只有当 appName 没有落到同名新实例
       // 手里时才能按 name 释放源码元数据，否则会清掉新实例的 appSpace。
       if (isAppNameOwner(this)) sourceCenter.releaseApp(this.name)
@@ -675,7 +674,6 @@ export default class CreateApp implements AppInterface {
   }
 
   /**
-   * 2026.9.12 by Claude Code
    * 终态销毁前的深度 DOM 清理。
    *
    * 背景：`container.innerHTML = ''` 只是把 <micro-app-head>/<micro-app-body> 从容器上
@@ -777,7 +775,7 @@ export default class CreateApp implements AppInterface {
     this.preRenderEvents = null
     this.setKeepAliveState(null)
     if (this.container) {
-      // 2026.9.12 by Claude Code: 仅终态销毁做深度清理；普通卸载/保活切换保持原行为
+      // 仅终态销毁做深度清理；普通卸载/保活切换保持原行为
       if (destroy) runCleanupStep(this.name, 'clear instance dom', () => this.clearInstanceDOM())
       this.container.innerHTML = ''
       this.container = null
@@ -820,7 +818,6 @@ export default class CreateApp implements AppInterface {
     // instance tasks even when a same-name replacement is already registered.
     runCleanupStep(this.name, 'dispose instance tasks', () => disposeAppTasks(this))
 
-    // 2026.9.12 by Claude Code
     // 下面这些清理全部按 appName 作用于**全局注册表**（源码中心、异步任务表、
     // scopedCSS observer、数据中心、iframe 节点表、Worker 表）。如果本次销毁的是
     // 已被同名新实例替换掉的旧实例，按 name 清理会连带抹掉新实例的状态，所以统一用
@@ -857,7 +854,6 @@ export default class CreateApp implements AppInterface {
     this.source.html = null
     this.source.links.clear()
     this.source.scripts.clear()
-    // 2026.9.12 by Claude Code
     // 直达终态销毁的路径（如 micro_app.ts 中 isUnmounted()/isPrefetch 且 destroy 的分支）
     // 不会经过 clearOptions，此时 container 可能仍然存在 —— 补一次深度清理。
     // 走正常 unmount→destroy 路径时 clearOptions 已清过，这里是幂等的空查询。

@@ -31,7 +31,6 @@ describe('app name ownership guard', () => {
   })
 
   /**
-   * 2026.9.12 by Claude Code
    * 销毁后的迟到回调（onLoad / fetchScriptSuccess / fetchLinkSuccess）捕获的是旧实例，
    * 而 sourceCenter / appTaskMap / dataCenter 等注册表按 appName 索引。旧实例被同名
    * 新实例替换后，按 name 清理会误伤新实例。

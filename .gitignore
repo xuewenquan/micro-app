@@ -31,4 +31,4 @@ logs
 .npm-cache/
 .browser-profile-heap/
 heap-analysis/
-codex-session-*.md
+/.local-reports/

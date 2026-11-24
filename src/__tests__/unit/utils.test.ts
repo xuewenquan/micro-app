@@ -38,7 +38,6 @@ describe('utils', () => {
 
   test('utils ==> formatAppURL', () => {
     /**
-     * 2026.9.12 by Claude Code
      * 这里原本断言目录型 url 会被补齐成带 '/' 的形式，但实现已经从 1.0.0 起明确不再补斜杠
      * （见 src/libs/utils.ts 中的注释与 https://github.com/jd-opensource/micro-app/issues/1147），
      * 该断言自那时起就是过期的。保留 url 原样是有意为之，避免把 .html/.php/.net 之类的地址改坏。

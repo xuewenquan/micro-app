@@ -28,7 +28,7 @@ export function createAppTask<T>(owner: TaskOwner, value: T, cleanup?: (value: T
 
   const release = (cancelled: boolean): void => {
     /**
-     * NOTE(已知边界) 2026.9.12 by Claude Code
+     * NOTE(已知边界)
      * 原实现用真值判断做幂等保护，falsy payload 会漏掉清理。
      * 2026.9.12 review: 已改为独立 released 标志，同时释放 instance owner。
      */

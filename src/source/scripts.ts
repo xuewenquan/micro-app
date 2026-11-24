@@ -40,7 +40,7 @@ import globalEnv, {
 } from '../libs/global_env'
 import { GLOBAL_CACHED_KEY } from '../constants'
 import sourceCenter from './source_center'
-// 2026.9.12 by Claude Code: 用于在"销毁后迟到的异步回调"里判断是否还能按 appName 清理
+// 用于在"销毁后迟到的异步回调"里判断是否还能按 appName 清理
 import { isAppNameOwner } from '../libs/app_registry'
 
 export type moduleCallBack = Func & { moduleCount?: number, errorCount?: number }
@@ -345,7 +345,6 @@ export function fetchScriptSuccess (
   app: AppInterface,
 ): void {
   if (app.isDestroyed?.()) {
-    // 2026.9.12 by Claude Code
     // 这是销毁之后才落地的取脚本回调，捕获的是旧实例。只有 appName 没被同名新实例
     // 接管时才能按 name 释放，否则会清掉新实例仍在使用的 appSpace。
     if (isAppNameOwner(app)) sourceCenter.releaseApp(app.name)
@@ -361,7 +360,7 @@ export function fetchScriptSuccess (
    * 2. if app is inline or script is esmodule, skip this step
    * 3. if global parseResult not exist, the current script occupies the position, when js is reused, parseResult is reference
    *
-   * NOTE(注释已过期) 2026.9.12 by Claude Code
+   * NOTE(注释已过期)
    * 上面第 1、3 条描述的是“跨 app 共享 parseResult”的旧机制：本轮改动已删除
    * getExistParseResult，现在只按当前 appSpace 判断，不存在全局 parseResult。
    * 另外 sourceCenter.releaseApp 在 appSpace 清空后会逐出整条 entry（已确认为有意），

@@ -21,7 +21,7 @@ import microApp from '../micro_app'
 import { AppManager } from '../app_manager'
 
 /**
- * NOTE(已知风险) 2026.9.12 by Claude Code
+ * NOTE(已知风险)
  * 这是模块级强引用 Map，保存 iframe 沙箱 patch 过的**每一个 DOM 节点**。
  * 它只会被 releaseElementInfoTree(appName) 清空，而该函数只在 IframeSandbox.destroy()
  * 里被调用。因此一旦某条销毁路径没走到 destroy（例如 sandBox 实例已被 clearOptions

@@ -240,7 +240,7 @@ export function restoreRawGlobalObjectProperties (): void {
   if (!snapshots) return
 
   /**
-   * TODO(待决定) 2026.9.12 by Claude Code
+   * TODO(待决定)
    * 这里会把 intrinsic 上“快照之后新增的一切属性”删除、并把快照里的描述符写回。
    * 由于本函数在 globalEnv.activeSandbox 归零（最后一个沙箱停止）时执行，如果
    * **基座应用自身**在 initGlobalEnv 之后给 Object/Array.prototype 等加了东西
